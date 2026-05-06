@@ -148,6 +148,7 @@ def generate_excel(
     margem: float,
     desconto_promo: float,
     aliquota: float,
+    spike_day: bool = False,
 ) -> bytes:
     """Gera um Excel com formatação profissional e retorna bytes."""
     wb = Workbook()
@@ -194,11 +195,12 @@ def generate_excel(
     ws["A1"].alignment = center_align
     ws.row_dimensions[1].height = 30
 
-    # ── Linhas 2-4: Parâmetros ──
+    # ── Linhas 2-5: Parâmetros ──
     params = [
         ("Margem Desejada", f"{margem*100:.1f}%"),
         ("Desconto Promocional (Fake Price)", f"{desconto_promo*100:.1f}%"),
         ("Imposto sobre Receita", f"{aliquota*100:.2f}%"),
+        ("Spike Day", "Ativo" if spike_day else "—"),
     ]
     for i, (label, value) in enumerate(params, start=2):
         ws.merge_cells(f"A{i}:E{i}")
@@ -213,27 +215,27 @@ def generate_excel(
         ws[f"F{i}"].alignment = left_align
         ws.row_dimensions[i].height = 18
 
-    ws.row_dimensions[5].height = 6   # espaço
+    ws.row_dimensions[6].height = 6   # espaço
 
-    # ── Linha 6: Cabeçalhos da tabela ──
+    # ── Linha 7: Cabeçalhos da tabela ──
     data_cols = [
         "ID Produto", "Nome", "Custo (R$)", "Preço Alvo (R$)",
         "Fake Price (R$)", "Lucro (R$)",
         "Comissão Shopee (R$)", "Status",
     ]
     for col_idx, col_name in enumerate(data_cols, start=1):
-        cell = ws.cell(row=6, column=col_idx, value=col_name)
+        cell = ws.cell(row=7, column=col_idx, value=col_name)
         cell.font = font_header
         cell.fill = fill_header
         cell.alignment = center_align
         cell.border = thin_gold
-    ws.row_dimensions[6].height = 22
+    ws.row_dimensions[7].height = 22
 
     # ── Linhas de dados ──
     currency_num = '#,##0.00'
     pct_num      = '0.0"%"'
 
-    for row_idx, (_, row) in enumerate(df.iterrows(), start=7):
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=8):
         viavel = bool(row["Viável"])
         fill_row = fill_ok if viavel else fill_nok
         fill_alt = fill_row_alt if row_idx % 2 == 0 else PatternFill("solid", fgColor="160430")
@@ -278,7 +280,7 @@ def generate_excel(
         ws.column_dimensions[get_column_letter(i)].width = w
 
     # ── Freeze panes ──
-    ws.freeze_panes = "A7"
+    ws.freeze_panes = "A8"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -329,14 +331,21 @@ with st.sidebar:
         help="Percentual de desconto aparente. O preço riscado será: Preço Alvo ÷ (1 - desconto%)",
     )
 
-    st.divider()
-
     st.markdown("**Imposto sobre Receita**")
     aliquota_pct = st.slider(
         "Imposto (%)", min_value=0, max_value=50, value=6, step=1,
         label_visibility="collapsed",
         help="Alíquota de imposto sobre a receita bruta (ex: Simples Nacional, Lucro Presumido)",
     )
+
+    st.divider()
+    st.markdown("**Taxa Spike Day**")
+    spike_day = st.toggle(
+        "Spike Day (+3,5%)",
+        value=False,
+        help="Taxa adicional cobrada pela Shopee em produtos participantes do Spike Day. Adiciona 3,5% sobre a receita bruta.",
+    )
+    spike_day_rate = 0.035 if spike_day else 0.0
 
     st.divider()
     st.markdown(
@@ -403,7 +412,7 @@ if uploaded is not None:
             sobretaxa_peso=0.0,
             margem=margem,
             desconto_promo=desconto_promo,
-            aliquota_imposto=aliquota,
+            aliquota_imposto=aliquota + spike_day_rate,
         )
 
         # ── Tabela de resultados ────────────────────────────────────────────
@@ -413,15 +422,17 @@ if uploaded is not None:
         )
 
         # Parâmetros exibidos como badges
-        st.markdown(
+        badges_html = (
             f"Parâmetros ativos: "
             + badge_html(f"Margem {margem_pct}%")
             + " &nbsp; "
             + badge_html(f"Promo {promo_pct}%", "#7B2FBE")
             + " &nbsp; "
-            + badge_html(f"Imposto {aliquota_pct:.1f}%", "#1a7a4a"),
-            unsafe_allow_html=True,
+            + badge_html(f"Imposto {aliquota_pct:.1f}%", "#1a7a4a")
         )
+        if spike_day:
+            badges_html += " &nbsp; " + badge_html("Spike Day +3,5%", "#E67E22")
+        st.markdown(badges_html, unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
         # Formata o DataFrame para exibição
@@ -461,12 +472,13 @@ if uploaded is not None:
             margem=margem,
             desconto_promo=desconto_promo,
             aliquota=aliquota,
+            spike_day=spike_day,
         )
 
         col_dl, col_info = st.columns([1, 3])
         with col_dl:
             st.download_button(
-                label="⬇️  Baixar Excel",
+                label="⬇️ Baixar Excel",
                 data=excel_bytes,
                 file_name="shopee_precificacao.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
