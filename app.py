@@ -387,12 +387,10 @@ with col_hint:
         "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
         " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
         "<b style='color:#D4AF37'>Colunas obrigatórias:</b><br>"
-        "• <code style='color:#e8d5ff'>ID</code> / <code style='color:#e8d5ff'>SKU</code> "
-        "/ <code style='color:#e8d5ff'>Código</code><br>"
+        "• <code style='color:#e8d5ff'>ID</code><br>"
         "• <code style='color:#e8d5ff'>Custo</code> (valor numérico em R$)<br>"
         "<b style='color:#D4AF37'>Colunas opcionais:</b><br>"
-        "• <code style='color:#e8d5ff'>Nome</code> &nbsp;"
-        "• <code style='color:#e8d5ff'>peso_extra_kg</code>"
+        "• <code style='color:#e8d5ff'>Nome</code>"
         "</div>",
         unsafe_allow_html=True,
     )
