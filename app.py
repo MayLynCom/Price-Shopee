@@ -46,6 +46,89 @@ def fmt_pct(v: float) -> str:
     return f"{v * 100:.1f}%"
 
 
+def render_cost_breakdown(row: pd.Series) -> None:
+    """
+    Renderiza uma caixa visual mostrando como o preço do produto se decompõe
+    entre comissão, imposto+spike, custo e lucro. Usa o primeiro produto
+    da tabela de resultados.
+    """
+    preco    = float(row["Preço Alvo (R$)"])
+    custo    = float(row["Custo (R$)"])
+    comissao = float(row["Comissão Shopee (R$)"])
+    lucro    = float(row["Lucro (R$)"])
+
+    # Imposto + Spike Day = o que sobra do preço após comissão, custo e lucro.
+    # Garante que os componentes somem exatamente 100%.
+    imposto_spike = max(0.0, preco - comissao - custo - lucro)
+
+    if preco <= 0:
+        return
+
+    pct_comissao = comissao      / preco * 100
+    pct_imposto  = imposto_spike / preco * 100
+    pct_custo    = custo         / preco * 100
+    pct_lucro    = lucro         / preco * 100
+
+    nome = str(row["Nome"])
+
+    componentes = [
+        ("Comissão Shopee",     comissao,      pct_comissao, "#E67E22"),
+        ("Imposto + Spike Day", imposto_spike, pct_imposto,  "#C0392B"),
+        ("Custo do Produto",    custo,         pct_custo,    "#7B2FBE"),
+        ("Lucro Líquido",       lucro,         pct_lucro,    "#1DB954"),
+    ]
+
+    linhas_html = ""
+    for label, valor, pct, cor in componentes:
+        bar_pct = max(0.0, min(100.0, pct))
+        linhas_html += (
+            "<div style=\"display:flex; align-items:center; gap:14px; "
+            "margin:8px 0;\">"
+            f"<div style=\"flex:0 0 170px; color:#e8d5ff; font-size:0.88rem;\">"
+            f"<span style=\"display:inline-block; width:10px; height:10px; "
+            f"background:{cor}; border-radius:2px; margin-right:8px;\"></span>"
+            f"{label}</div>"
+            f"<div style=\"flex:0 0 110px; color:{cor}; font-weight:700; "
+            f"font-size:0.9rem; text-align:right;\">{fmt_brl(valor)}</div>"
+            f"<div style=\"flex:0 0 60px; color:#c8a8e9; font-size:0.85rem; "
+            f"text-align:right;\">{pct:.1f}%</div>"
+            "<div style=\"flex:1; background:#0f0120; border:1px solid #3d1562; "
+            "border-radius:4px; height:16px; overflow:hidden;\">"
+            f"<div style=\"width:{bar_pct:.2f}%; height:100%; background:{cor};\""
+            "></div></div>"
+            "</div>"
+        )
+
+    receita_liquida = preco - comissao
+    margem_liquida = (lucro / receita_liquida * 100) if receita_liquida > 0 else 0.0
+
+    html = (
+        "<div style=\"background:#1f063b; border:1px solid #7B2FBE; "
+        "border-radius:10px; padding:18px 20px; margin:18px 0;\">"
+        "<div style=\"color:#D4AF37; font-weight:700; font-size:1rem; "
+        "margin-bottom:4px;\">"
+        f"📊 Como o preço de {fmt_brl(preco)} é composto"
+        "</div>"
+        "<div style=\"color:#c8a8e9; font-size:0.82rem; margin-bottom:14px;\">"
+        f"Primeiro produto da tabela: <b style=\"color:#e8d5ff\">{nome}</b>"
+        " &nbsp;·&nbsp; Total <b style=\"color:#D4AF37\">100%</b>"
+        "</div>"
+        f"{linhas_html}"
+        "<div style=\"margin-top:14px; padding:10px 12px; background:#0f0120; "
+        "border-left:3px solid #1DB954; border-radius:4px; color:#c8a8e9; "
+        "font-size:0.78rem; line-height:1.5;\">"
+        "<b style=\"color:#1DB954;\">ℹ️ Sobre o lucro:</b> "
+        "os percentuais acima são sobre o <b>preço de venda total</b>. "
+        "Porém, a <b>margem de lucro real</b> é calculada sobre a "
+        "<b>receita líquida</b> (preço já descontado da comissão Shopee + taxa fixa). "
+        f"Receita líquida: <b style=\"color:#D4AF37;\">{fmt_brl(receita_liquida)}</b> &nbsp;·&nbsp; "
+        f"Margem real: <b style=\"color:#1DB954;\">{margem_liquida:.1f}%</b>"
+        "</div>"
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def parse_excel(file) -> pd.DataFrame | None:
     """
     Lê o arquivo Excel e normaliza os nomes das colunas.
@@ -395,6 +478,18 @@ with col_hint:
         unsafe_allow_html=True,
     )
 
+# ── Aviso de privacidade ──────────────────────────────────────────────────────
+st.markdown(
+    "<div style='background:#1f063b; border-left: 4px solid #D4AF37; "
+    "border-radius:6px; padding:10px 14px; color:#c8a8e9; font-size:0.82rem; "
+    "margin-top: 12px;'>"
+    "🔒 <b style='color:#D4AF37'>Privacidade:</b> "
+    "seus dados de custo <b>não são armazenados</b>. "
+    "Eles são usados apenas para o cálculo e descartados ao atualizar a página."
+    "</div>",
+    unsafe_allow_html=True,
+)
+
 # ── Processamento ─────────────────────────────────────────────────────────────
 if uploaded is not None:
     if "last_file" not in st.session_state or st.session_state.last_file != uploaded.name:
@@ -458,6 +553,10 @@ if uploaded is not None:
         )
 
         st.dataframe(styled, use_container_width=True, height=420)
+
+        # ── Breakdown de custos do primeiro produto ────────────────────────
+        if len(df_results) > 0:
+            render_cost_breakdown(df_results.iloc[0])
 
         # ── Exportação ─────────────────────────────────────────────────────
         st.markdown(
