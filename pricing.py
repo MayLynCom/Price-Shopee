@@ -1,16 +1,30 @@
 """
 Motor de precificação para Shopee.
 
-Fórmula fechada por faixa de taxa:
-    P = [f × (1 - m) + C] / [(1 - t - i) - m × (1 - t)]
+Lógica: regra de três sobre o preço total ("Forma A").
+
+O preço de venda é uma "pizza de 100%" dividida em 4 fatias percentuais
+que somam exatamente 100%:
+
+    100% = Comissão% + Imposto% + Margem% + (Custo + Taxa Fixa)%
+
+Resolvendo para P:
+
+    P = (C + f) / (1 - t - i - m)
 
 Onde:
     P = preço de venda alvo
     C = custo total (produto + sobretaxa de peso)
     t = comissão percentual da Shopee (ex: 0.14)
-    f = taxa fixa da Shopee (ex: R$26)
-    i = imposto sobre receita bruta
-    m = margem desejada (ex: 0.30 para 30%)
+    f = taxa fixa da Shopee (ex: R$26) — agrupada com o custo na pizza
+    i = imposto sobre receita bruta (inclui Spike Day se ativo)
+    m = margem desejada sobre o preço total (ex: 0.10 para 10% do preço)
+
+O lucro líquido é exatamente m × P (uma fatia limpa de m% do preço final).
+
+O break-even REAL é o preço onde despesa = preço (lucro = 0):
+    P_be = (C + f) / (1 − t − i)
+É um valor único: vender abaixo disso = prejuízo.
 
 Como a faixa de taxa depende do preço, resolve-se P para cada faixa
 e verifica se o resultado cai dentro daquele intervalo.
@@ -36,11 +50,13 @@ class PricingResult:
     nome_produto: str
     custo: float
     preco_venda: float
+    preco_break_even: float     # preço onde lucro = 0 (despesa = preço)
+    taxa_fixa_shopee: float     # parte fixa da comissão (R$, ex: R$ 26)
     fake_price: float
     comissao_shopee: float
     imposto_valor: float
     lucro: float
-    margem_real: float          # percentual 0-1
+    margem_real: float          # percentual 0-1 (lucro sobre o preço total)
     pix_subsidy_pct: float
     tier: ShopeeFeeTier
     viavel: bool                # False se não há solução válida
@@ -72,12 +88,12 @@ def calcular_preco(
         t = tier.commission_pct
         f = tier.fixed_fee
 
-        denominador = (1 - t - i) - m * (1 - t)
+        denominador = 1 - t - i - m
 
-        if abs(denominador) < 1e-9:
+        if denominador <= 1e-9:
             continue
 
-        P = (f * (1 - m) + C) / denominador
+        P = (C + f) / denominador
 
         if P < 0:
             continue
@@ -107,6 +123,8 @@ def calcular_preco(
         nome_produto=nome_produto,
         custo=C,
         preco_venda=0.0,
+        preco_break_even=0.0,
+        taxa_fixa_shopee=0.0,
         fake_price=0.0,
         comissao_shopee=0.0,
         imposto_valor=0.0,
@@ -133,9 +151,13 @@ def _build_result(
 ) -> PricingResult:
     comissao = P * t + f
     imposto_valor = P * i
-    receita_liquida = P - comissao
-    lucro = receita_liquida - C - imposto_valor
-    margem_real = lucro / receita_liquida if receita_liquida > 0 else 0.0
+    lucro = P * m
+    margem_real = m
+
+    # Break-even REAL: preço onde lucro = 0 (despesa = preço).
+    # C + (P_be * t + f) + P_be * i = P_be  →  P_be = (C + f) / (1 - t - i)
+    denom_be = 1 - t - i
+    preco_break_even = (C + f) / denom_be if denom_be > 1e-9 else 0.0
 
     fake_price = P / (1 - desconto_promo) if desconto_promo < 1.0 else P
 
@@ -144,6 +166,8 @@ def _build_result(
         nome_produto=nome_produto,
         custo=C,
         preco_venda=round(P, 2),
+        preco_break_even=round(preco_break_even, 2),
+        taxa_fixa_shopee=round(f, 2),
         fake_price=round(fake_price, 2),
         comissao_shopee=round(comissao, 2),
         imposto_valor=round(imposto_valor, 2),

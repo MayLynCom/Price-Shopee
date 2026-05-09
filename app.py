@@ -48,81 +48,135 @@ def fmt_pct(v: float) -> str:
 
 def render_cost_breakdown(row: pd.Series) -> None:
     """
-    Renderiza uma caixa visual mostrando como o preço do produto se decompõe
-    entre comissão, imposto+spike, custo e lucro. Usa o primeiro produto
-    da tabela de resultados.
+    Renderiza um gráfico de pizza (donut) mostrando como o preço do produto
+    se decompõe em 4 fatias limpas:
+      • Custo + Taxa Fixa Shopee  (a taxa fixa é agrupada com o custo
+                                    porque é um valor fixo, não percentual)
+      • Comissão Shopee %         (apenas a parte percentual)
+      • Imposto + Spike Day
+      • Lucro Líquido (% do preço)
     """
-    preco    = float(row["Preço Alvo (R$)"])
-    custo    = float(row["Custo (R$)"])
-    comissao = float(row["Comissão Shopee (R$)"])
-    lucro    = float(row["Lucro (R$)"])
-
-    # Imposto + Spike Day = o que sobra do preço após comissão, custo e lucro.
-    # Garante que os componentes somem exatamente 100%.
-    imposto_spike = max(0.0, preco - comissao - custo - lucro)
+    preco       = float(row["Preço Alvo (R$)"])
+    custo       = float(row["Custo (R$)"])
+    comissao    = float(row["Comissão Shopee (R$)"])
+    taxa_fixa   = float(row["Taxa Fixa Shopee (R$)"])
+    lucro       = float(row["Lucro (R$)"])
+    break_even  = float(row["Break-Even (R$)"])
+    margem_real = float(row["Margem Real"])
 
     if preco <= 0:
         return
 
-    pct_comissao = comissao      / preco * 100
+    # Comissão Shopee % (só a parte percentual, sem a taxa fixa)
+    comissao_pct = max(0.0, comissao - taxa_fixa)
+    # Custo do produto + taxa fixa Shopee (agrupados na pizza)
+    custo_e_taxa = custo + taxa_fixa
+    # Imposto + Spike Day = o que sobra do preço após o resto.
+    # Garante que os componentes somem exatamente 100%.
+    imposto_spike = max(0.0, preco - comissao_pct - custo_e_taxa - lucro)
+
+    pct_comissao = comissao_pct  / preco * 100
     pct_imposto  = imposto_spike / preco * 100
-    pct_custo    = custo         / preco * 100
+    pct_custo    = custo_e_taxa  / preco * 100
     pct_lucro    = lucro         / preco * 100
 
     nome = str(row["Nome"])
 
     componentes = [
-        ("Comissão Shopee",     comissao,      pct_comissao, "#E67E22"),
-        ("Imposto + Spike Day", imposto_spike, pct_imposto,  "#C0392B"),
-        ("Custo do Produto",    custo,         pct_custo,    "#7B2FBE"),
-        ("Lucro Líquido",       lucro,         pct_lucro,    "#1DB954"),
+        ("Comissão Shopee (%)",       comissao_pct,  pct_comissao, "#E67E22"),
+        ("Imposto + Spike Day",       imposto_spike, pct_imposto,  "#C0392B"),
+        ("Custo + Taxa Fixa Shopee",  custo_e_taxa,  pct_custo,    "#7B2FBE"),
+        ("Lucro Líquido",             lucro,         pct_lucro,    "#1DB954"),
     ]
 
-    linhas_html = ""
-    for label, valor, pct, cor in componentes:
-        bar_pct = max(0.0, min(100.0, pct))
-        linhas_html += (
-            "<div style=\"display:flex; align-items:center; gap:14px; "
-            "margin:8px 0;\">"
-            f"<div style=\"flex:0 0 170px; color:#e8d5ff; font-size:0.88rem;\">"
-            f"<span style=\"display:inline-block; width:10px; height:10px; "
-            f"background:{cor}; border-radius:2px; margin-right:8px;\"></span>"
-            f"{label}</div>"
-            f"<div style=\"flex:0 0 110px; color:{cor}; font-weight:700; "
-            f"font-size:0.9rem; text-align:right;\">{fmt_brl(valor)}</div>"
-            f"<div style=\"flex:0 0 60px; color:#c8a8e9; font-size:0.85rem; "
-            f"text-align:right;\">{pct:.1f}%</div>"
-            "<div style=\"flex:1; background:#0f0120; border:1px solid #3d1562; "
-            "border-radius:4px; height:16px; overflow:hidden;\">"
-            f"<div style=\"width:{bar_pct:.2f}%; height:100%; background:{cor};\""
-            "></div></div>"
-            "</div>"
-        )
+    # Monta as fatias da pizza usando conic-gradient (CSS puro)
+    cumul = 0.0
+    slices = []
+    for _, _, pct, cor in componentes:
+        start = cumul
+        end = cumul + pct
+        slices.append(f"{cor} {start:.4f}% {end:.4f}%")
+        cumul = end
+    conic = ", ".join(slices)
 
-    receita_liquida = preco - comissao
-    margem_liquida = (lucro / receita_liquida * 100) if receita_liquida > 0 else 0.0
+    # Legenda à direita do donut
+    legenda_html = ""
+    for label, valor, pct, cor in componentes:
+        legenda_html += (
+            f"<div style=\"display:flex; align-items:center; gap:10px; "
+            f"margin:8px 0; padding:8px 12px; background:#0f0120; "
+            f"border-left:3px solid {cor}; border-radius:4px;\">"
+            f"<span style=\"display:inline-block; width:14px; height:14px; "
+            f"background:{cor}; border-radius:3px; flex-shrink:0;\"></span>"
+            f"<span style=\"flex:1; color:#e8d5ff; font-size:0.9rem;\">{label}</span>"
+            f"<span style=\"color:{cor}; font-weight:700; font-size:0.92rem; "
+            f"min-width:90px; text-align:right;\">{fmt_brl(valor)}</span>"
+            f"<span style=\"color:#c8a8e9; font-size:0.85rem; "
+            f"min-width:55px; text-align:right;\">{pct:.1f}%</span>"
+            f"</div>"
+        )
 
     html = (
         "<div style=\"background:#1f063b; border:1px solid #7B2FBE; "
         "border-radius:10px; padding:18px 20px; margin:18px 0;\">"
         "<div style=\"color:#D4AF37; font-weight:700; font-size:1rem; "
         "margin-bottom:4px;\">"
-        f"📊 Como o preço de {fmt_brl(preco)} é composto"
+        f"🥧 Como o preço de {fmt_brl(preco)} é composto"
         "</div>"
-        "<div style=\"color:#c8a8e9; font-size:0.82rem; margin-bottom:14px;\">"
+        "<div style=\"color:#c8a8e9; font-size:0.82rem; margin-bottom:18px;\">"
         f"Primeiro produto da tabela: <b style=\"color:#e8d5ff\">{nome}</b>"
         " &nbsp;·&nbsp; Total <b style=\"color:#D4AF37\">100%</b>"
         "</div>"
-        f"{linhas_html}"
-        "<div style=\"margin-top:14px; padding:10px 12px; background:#0f0120; "
-        "border-left:3px solid #1DB954; border-radius:4px; color:#c8a8e9; "
-        "font-size:0.78rem; line-height:1.5;\">"
-        "<b style=\"color:#1DB954;\">ℹ️ Sobre o lucro:</b> "
-        "os percentuais acima são sobre o <b>preço de venda total</b>. "
-        "Porém, a <b>margem de lucro real</b> é calculada sobre a "
-        "<b>receita líquida</b> (preço já descontado da comissão Shopee + taxa fixa). "
-        f"Receita líquida: <b style=\"color:#D4AF37;\">{fmt_brl(receita_liquida)}</b> &nbsp;·&nbsp; "
-        f"Margem real: <b style=\"color:#1DB954;\">{margem_liquida:.1f}%</b>"
+        "<div style=\"display:flex; gap:32px; align-items:center; "
+        "flex-wrap:wrap; justify-content:center;\">"
+        f"<div style=\"width:230px; height:230px; border-radius:50%; "
+        f"background:conic-gradient({conic}); position:relative; "
+        "flex-shrink:0; box-shadow:0 4px 24px rgba(212, 175, 55, 0.25); "
+        "border:2px solid #D4AF37;\">"
+        "<div style=\"position:absolute; top:50%; left:50%; "
+        "transform:translate(-50%, -50%); width:120px; height:120px; "
+        "border-radius:50%; background:#1f063b; "
+        "display:flex; flex-direction:column; align-items:center; "
+        "justify-content:center; border:1px solid #3d1562; "
+        "box-shadow:inset 0 2px 10px rgba(0, 0, 0, 0.4);\">"
+        "<div style=\"font-size:0.7rem; color:#c8a8e9; "
+        "text-transform:uppercase; letter-spacing:0.5px;\">Preço Alvo</div>"
+        f"<div style=\"font-size:1.05rem; font-weight:700; color:#D4AF37; "
+        f"margin-top:2px;\">{fmt_brl(preco)}</div>"
+        "</div>"
+        "</div>"
+        f"<div style=\"flex:1; min-width:300px;\">{legenda_html}</div>"
+        "</div>"
+        # ── Caixa "Como funciona" ────────────────────────────────────────
+        "<div style=\"margin-top:18px; padding:14px 16px; background:#0f0120; "
+        "border-left:3px solid #1DB954; border-radius:6px; color:#c8a8e9; "
+        "font-size:0.82rem; line-height:1.6;\">"
+        "<div style=\"color:#1DB954; font-weight:700; font-size:0.95rem; "
+        "margin-bottom:8px;\">ℹ️ Como funciona o cálculo</div>"
+        # Linha 1: explicação da lógica
+        "<div style=\"margin-bottom:10px;\">"
+        "O cálculo é uma <b style=\"color:#D4AF37;\">regra de três</b> simples: "
+        "o preço de venda é uma pizza de <b>100%</b> dividida em 4 fatias. "
+        f"O <b style=\"color:#1DB954;\">Lucro Líquido</b> é "
+        f"<b style=\"color:#1DB954;\">{margem_real * 100:.1f}% do preço total</b> "
+        f"= <b style=\"color:#1DB954;\">{fmt_brl(lucro)}</b>, garantido por construção "
+        "(é uma fatia limpa da pizza)."
+        "</div>"
+        # Linha 2: break-even REAL (preço onde lucro = 0)
+        "<div style=\"padding:8px 10px; background:#1f063b; border-radius:4px;\">"
+        "<b style=\"color:#E67E22;\">⚖️ Break-Even (preço de equilíbrio):</b> "
+        f"<b style=\"color:#D4AF37;\">{fmt_brl(break_even)}</b>. "
+        "Esse é o <b>preço mínimo</b> que você teria que cobrar para cobrir "
+        "exatamente todas as despesas (custo do produto + comissão Shopee + "
+        "imposto), <b>sem ganhar e nem perder nada</b>."
+        "<div style=\"margin-top:6px; font-size:0.78rem; color:#a98ec9;\">"
+        "Vender <b style=\"color:#E74C3C;\">abaixo</b> disso = prejuízo. "
+        f"Vender <b style=\"color:#1DB954;\">acima</b> disso = lucro positivo. "
+        f"No preço atual de <b>{fmt_brl(preco)}</b>, seu lucro líquido é "
+        f"<b style=\"color:#1DB954;\">{fmt_brl(lucro)}</b> "
+        f"({margem_real * 100:.1f}% do preço)."
+        "</div>"
+        "</div>"
         "</div>"
         "</div>"
     )
@@ -216,9 +270,13 @@ def build_results_df(
             "Nome": r.nome_produto,
             "Custo (R$)": r.custo,
             "Preço Alvo (R$)": r.preco_venda,
+            "Break-Even (R$)": r.preco_break_even,
             "Fake Price (R$)": r.fake_price,
             "Lucro (R$)": r.lucro,
             "Comissão Shopee (R$)": r.comissao_shopee,
+            "Taxa Fixa Shopee (R$)": r.taxa_fixa_shopee,
+            "Imposto (R$)": r.imposto_valor,
+            "Margem Real": r.margem_real,
             "Viável": r.viavel,
         })
 
@@ -402,9 +460,9 @@ with st.sidebar:
 
     st.markdown("**Margem de Lucro**")
     margem_pct = st.slider(
-        "Margem (%)", min_value=5, max_value=80, value=30, step=1,
+        "Margem (%)", min_value=5, max_value=80, value=10, step=1,
         label_visibility="collapsed",
-        help="Margem desejada sobre a receita líquida após comissão Shopee",
+        help="Margem sobre o preço total de venda. Ex: 10% = o lucro será 10% do preço cobrado (uma fatia limpa da pizza).",
     )
 
     st.markdown("**Desconto Fake Price**")
@@ -416,7 +474,7 @@ with st.sidebar:
 
     st.markdown("**Imposto sobre Receita**")
     aliquota_pct = st.slider(
-        "Imposto (%)", min_value=0, max_value=50, value=6, step=1,
+        "Imposto (%)", min_value=0, max_value=50, value=10, step=1,
         label_visibility="collapsed",
         help="Alíquota de imposto sobre a receita bruta (ex: Simples Nacional, Lucro Presumido)",
     )
@@ -529,7 +587,12 @@ if uploaded is not None:
         st.markdown("<br>", unsafe_allow_html=True)
 
         # Formata o DataFrame para exibição
-        display_df = df_results.drop(columns=["Viável"]).copy()
+        display_df = df_results.drop(
+            columns=[
+                "Viável", "Break-Even (R$)", "Taxa Fixa Shopee (R$)",
+                "Imposto (R$)", "Margem Real",
+            ]
+        ).copy()
 
         # Formatação condicional por margem (cor de fundo via Styler)
         def color_rows(row):
