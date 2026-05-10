@@ -3,27 +3,30 @@ Motor de precificação para Shopee.
 
 Lógica: regra de três sobre o preço total ("Forma A").
 
-O preço de venda é uma "pizza de 100%" dividida em 4 fatias percentuais
+O preço de venda é uma "pizza de 100%" dividida em fatias percentuais
 que somam exatamente 100%:
 
-    100% = Comissão% + Imposto% + Margem% + (Custo + Taxa Fixa)%
+    100% = Comissão% + Imposto% + Margem% + TACOS% + Afiliado%
+           + (Custo + Taxa Fixa)%
 
 Resolvendo para P:
 
-    P = (C + f) / (1 - t - i - m)
+    P = (C + f) / (1 - t - i - m - tacos - afil)
 
 Onde:
-    P = preço de venda alvo
-    C = custo total (produto + sobretaxa de peso)
-    t = comissão percentual da Shopee (ex: 0.14)
-    f = taxa fixa da Shopee (ex: R$26) — agrupada com o custo na pizza
-    i = imposto sobre receita bruta (inclui Spike Day se ativo)
-    m = margem desejada sobre o preço total (ex: 0.10 para 10% do preço)
+    P     = preço de venda alvo
+    C     = custo total (produto + sobretaxa de peso)
+    t     = comissão percentual da Shopee (ex: 0.14)
+    f     = taxa fixa da Shopee (ex: R$26) — agrupada com o custo na pizza
+    i     = imposto sobre receita bruta (inclui Spike Day se ativo)
+    m     = margem desejada sobre o preço total (ex: 0.10 para 10% do preço)
+    tacos = custo de anúncios (TACOS) sobre a receita (ex: 0.05)
+    afil  = comissão de afiliado sobre a receita (ex: 0.03)
 
 O lucro líquido é exatamente m × P (uma fatia limpa de m% do preço final).
 
 O break-even REAL é o preço onde despesa = preço (lucro = 0):
-    P_be = (C + f) / (1 − t − i)
+    P_be = (C + f) / (1 − t − i − tacos − afil)
 É um valor único: vender abaixo disso = prejuízo.
 
 Como a faixa de taxa depende do preço, resolve-se P para cada faixa
@@ -60,6 +63,8 @@ class PricingResult:
     pix_subsidy_pct: float
     tier: ShopeeFeeTier
     viavel: bool                # False se não há solução válida
+    tacos_valor: float = 0.0    # valor de TACOS em R$
+    afiliado_valor: float = 0.0  # valor de comissão de afiliado em R$
 
 
 def calcular_preco(
@@ -70,6 +75,8 @@ def calcular_preco(
     margem_desejada: float,     # 0 a 1
     desconto_promo: float,      # 0 a 1  — para calcular fake_price
     aliquota_imposto: float,    # 0 a 1
+    tacos_pct: float = 0.0,     # 0 a 1  — custo de anúncios (TACOS)
+    afiliado_pct: float = 0.0,  # 0 a 1  — comissão de afiliado
 ) -> PricingResult:
     """
     Calcula o preço de venda ideal para atingir a margem desejada após
@@ -81,6 +88,8 @@ def calcular_preco(
     C = custo_produto + sobretaxa_peso
     m = margem_desejada
     i = aliquota_imposto
+    tacos = tacos_pct
+    afil = afiliado_pct
 
     best: Optional[PricingResult] = None
 
@@ -88,7 +97,7 @@ def calcular_preco(
         t = tier.commission_pct
         f = tier.fixed_fee
 
-        denominador = 1 - t - i - m
+        denominador = 1 - t - i - m - tacos - afil
 
         if denominador <= 1e-9:
             continue
@@ -104,6 +113,7 @@ def calcular_preco(
             return _build_result(
                 produto_id, nome_produto, C, P, m, i, t, f,
                 desconto_promo, tier, viavel=True,
+                tacos=tacos, afil=afil,
             )
 
         # Guarda o melhor candidato fora da faixa para fallback
@@ -111,6 +121,7 @@ def calcular_preco(
             best = _build_result(
                 produto_id, nome_produto, C, P, m, i, t, f,
                 desconto_promo, tier, viavel=False,
+                tacos=tacos, afil=afil,
             )
 
     # Nenhuma faixa se encaixou — retorna o fallback com viavel=False
@@ -133,6 +144,8 @@ def calcular_preco(
         pix_subsidy_pct=0.0,
         tier=SHOPEE_FEE_TIERS[0],
         viavel=False,
+        tacos_valor=0.0,
+        afiliado_valor=0.0,
     )
 
 
@@ -148,15 +161,19 @@ def _build_result(
     desconto_promo: float,
     tier: ShopeeFeeTier,
     viavel: bool,
+    tacos: float = 0.0,
+    afil: float = 0.0,
 ) -> PricingResult:
     comissao = P * t + f
     imposto_valor = P * i
     lucro = P * m
     margem_real = m
+    tacos_valor = P * tacos
+    afiliado_valor = P * afil
 
     # Break-even REAL: preço onde lucro = 0 (despesa = preço).
-    # C + (P_be * t + f) + P_be * i = P_be  →  P_be = (C + f) / (1 - t - i)
-    denom_be = 1 - t - i
+    # P_be = (C + f) / (1 - t - i - tacos - afil)
+    denom_be = 1 - t - i - tacos - afil
     preco_break_even = (C + f) / denom_be if denom_be > 1e-9 else 0.0
 
     fake_price = P / (1 - desconto_promo) if desconto_promo < 1.0 else P
@@ -176,6 +193,8 @@ def _build_result(
         pix_subsidy_pct=tier.pix_subsidy_pct,
         tier=tier,
         viavel=viavel,
+        tacos_valor=round(tacos_valor, 2),
+        afiliado_valor=round(afiliado_valor, 2),
     )
 
 
@@ -185,6 +204,8 @@ def calcular_lote(
     margem_desejada: float,
     desconto_promo: float,
     aliquota_imposto: float,
+    tacos_pct: float = 0.0,
+    afiliado_pct: float = 0.0,
 ) -> list[PricingResult]:
     """
     Processa uma lista de dicts com chaves: id, nome, custo, peso_extra_kg (opt).
@@ -200,6 +221,8 @@ def calcular_lote(
             margem_desejada=margem_desejada,
             desconto_promo=desconto_promo,
             aliquota_imposto=aliquota_imposto,
+            tacos_pct=tacos_pct,
+            afiliado_pct=afiliado_pct,
         )
         resultados.append(r)
     return resultados

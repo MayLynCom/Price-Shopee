@@ -6,6 +6,7 @@ Execução:
 """
 
 import io
+import re
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -15,7 +16,7 @@ from openpyxl.styles import (
 )
 from openpyxl.utils import get_column_letter
 
-from pricing import calcular_lote
+from pricing import calcular_preco
 from styles import (
     CUSTOM_CSS, TITLE_HTML, SIDEBAR_HEADER_HTML,
     section_header, badge_html,
@@ -46,15 +47,74 @@ def fmt_pct(v: float) -> str:
     return f"{v * 100:.1f}%"
 
 
+def parse_br_currency(value) -> float:
+    """
+    Converte texto de valor monetário para float.
+
+    Aceita formato brasileiro (49,90 / 1.234,56), formato americano com vírgula
+    de milhar (1,234.56) e strings vindas do Excel com ponto decimal (49.9),
+    sem remover o ponto — que antes virava 499 incorretamente.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if pd.isna(value):
+            return 0.0
+        return float(value)
+
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "-"):
+        return 0.0
+
+    s = re.sub(r"[R$\s]", "", s, flags=re.I)
+    if not s:
+        return 0.0
+
+    last_comma = s.rfind(",")
+    last_dot = s.rfind(".")
+    has_comma = "," in s
+    has_dot = "." in s
+
+    if has_comma and has_dot:
+        if last_comma > last_dot:
+            # BR: vírgula é decimal; pontos são milhar (ex: 1.234,56)
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # US: ponto decimal; vírgulas são milhar (ex: 1,234.56)
+            s = s.replace(",", "")
+    elif has_comma and not has_dot:
+        s = s.replace(",", ".")
+    elif has_dot and not has_comma:
+        # Só pontos: Excel usa como decimal (49.9); BR pode usar como milhar (1.234)
+        parts = s.split(".")
+        if len(parts) == 2:
+            frac = parts[1]
+            if len(frac) <= 2:
+                pass  # decimal tipo 49.90 (Excel / exportação)
+            elif len(frac) == 3:
+                s = parts[0] + parts[1]  # milhar BR: 1.234 → 1234
+            else:
+                s = "".join(parts)
+        else:
+            s = "".join(parts)
+
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
 def render_cost_breakdown(row: pd.Series) -> None:
     """
     Renderiza um gráfico de pizza (donut) mostrando como o preço do produto
-    se decompõe em 4 fatias limpas:
+    se decompõe em fatias limpas:
       • Custo + Taxa Fixa Shopee  (a taxa fixa é agrupada com o custo
                                     porque é um valor fixo, não percentual)
       • Comissão Shopee %         (apenas a parte percentual)
       • Imposto + Spike Day
       • Lucro Líquido (% do preço)
+      • TACOS                     (apenas se > 0)
+      • Afiliado                  (apenas se > 0)
     """
     preco       = float(row["Preço Alvo (R$)"])
     custo       = float(row["Custo (R$)"])
@@ -63,6 +123,8 @@ def render_cost_breakdown(row: pd.Series) -> None:
     lucro       = float(row["Lucro (R$)"])
     break_even  = float(row["Break-Even (R$)"])
     margem_real = float(row["Margem Real"])
+    tacos_v     = float(row.get("TACOS (R$)", 0.0) or 0.0)
+    afiliado_v  = float(row.get("Afiliado (R$)", 0.0) or 0.0)
 
     if preco <= 0:
         return
@@ -73,12 +135,17 @@ def render_cost_breakdown(row: pd.Series) -> None:
     custo_e_taxa = custo + taxa_fixa
     # Imposto + Spike Day = o que sobra do preço após o resto.
     # Garante que os componentes somem exatamente 100%.
-    imposto_spike = max(0.0, preco - comissao_pct - custo_e_taxa - lucro)
+    imposto_spike = max(
+        0.0,
+        preco - comissao_pct - custo_e_taxa - lucro - tacos_v - afiliado_v,
+    )
 
     pct_comissao = comissao_pct  / preco * 100
     pct_imposto  = imposto_spike / preco * 100
     pct_custo    = custo_e_taxa  / preco * 100
     pct_lucro    = lucro         / preco * 100
+    pct_tacos    = tacos_v       / preco * 100
+    pct_afiliado = afiliado_v    / preco * 100
 
     nome = str(row["Nome"])
 
@@ -88,6 +155,15 @@ def render_cost_breakdown(row: pd.Series) -> None:
         ("Custo + Taxa Fixa Shopee",  custo_e_taxa,  pct_custo,    "#7B2FBE"),
         ("Lucro Líquido",             lucro,         pct_lucro,    "#1DB954"),
     ]
+    # Só inclui TACOS / Afiliado quando > 0 (abaixo de Lucro)
+    if tacos_v > 0:
+        componentes.append(
+            ("TACOS (Anúncios)",      tacos_v,       pct_tacos,    "#F39C12")
+        )
+    if afiliado_v > 0:
+        componentes.append(
+            ("Comissão de Afiliado",  afiliado_v,    pct_afiliado, "#8E44AD")
+        )
 
     # Monta as fatias da pizza usando conic-gradient (CSS puro)
     cumul = 0.0
@@ -219,19 +295,11 @@ def parse_excel(file) -> pd.DataFrame | None:
                      "Certifique-se de ter uma coluna chamada 'Custo' ou 'Cost'.")
             return None
 
-        # Converte custo para float
-        df["custo"] = (
-            df["custo"]
-            .str.replace(r"[R$\s]", "", regex=True)
-            .str.replace(".", "", regex=False)
-            .str.replace(",", ".", regex=False)
-            .astype(float)
-        )
+        # Converte custo para float (BR: 49,90 / 1.234,56; Excel: 49.9)
+        df["custo"] = df["custo"].map(parse_br_currency)
 
         if "peso_extra_kg" in df.columns:
-            df["peso_extra_kg"] = pd.to_numeric(
-                df["peso_extra_kg"].str.replace(",", "."), errors="coerce"
-            ).fillna(0.0)
+            df["peso_extra_kg"] = df["peso_extra_kg"].map(parse_br_currency)
         else:
             df["peso_extra_kg"] = 0.0
 
@@ -252,19 +320,34 @@ def build_results_df(
     margem: float,
     desconto_promo: float,
     aliquota_imposto: float,
+    tacos_pct: float = 0.0,
+    afiliado_pct: float = 0.0,
+    margens_override: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    """Executa o motor de cálculo e retorna um DataFrame formatado."""
-    produtos = df_raw.to_dict("records")
-    resultados = calcular_lote(
-        produtos=produtos,
-        sobretaxa_peso=sobretaxa_peso,
-        margem_desejada=margem,
-        desconto_promo=desconto_promo,
-        aliquota_imposto=aliquota_imposto,
-    )
+    """
+    Executa o motor de cálculo e retorna um DataFrame formatado.
 
+    Se ``margens_override`` for passado (dict {id_produto: margem 0-1}),
+    cada produto presente nele usa a margem específica em vez da global.
+    """
     rows = []
-    for r in resultados:
+    for p in df_raw.to_dict("records"):
+        pid = str(p.get("id", ""))
+        m = margem
+        if margens_override and pid in margens_override:
+            m = float(margens_override[pid])
+        sobretaxa = sobretaxa_peso * p.get("peso_extra_kg", 0.0)
+        r = calcular_preco(
+            produto_id=pid,
+            nome_produto=str(p.get("nome", "")),
+            custo_produto=float(p.get("custo", 0.0)),
+            sobretaxa_peso=sobretaxa,
+            margem_desejada=m,
+            desconto_promo=desconto_promo,
+            aliquota_imposto=aliquota_imposto,
+            tacos_pct=tacos_pct,
+            afiliado_pct=afiliado_pct,
+        )
         rows.append({
             "ID Produto": r.produto_id,
             "Nome": r.nome_produto,
@@ -276,6 +359,8 @@ def build_results_df(
             "Comissão Shopee (R$)": r.comissao_shopee,
             "Taxa Fixa Shopee (R$)": r.taxa_fixa_shopee,
             "Imposto (R$)": r.imposto_valor,
+            "TACOS (R$)": r.tacos_valor,
+            "Afiliado (R$)": r.afiliado_valor,
             "Margem Real": r.margem_real,
             "Viável": r.viavel,
         })
@@ -290,8 +375,16 @@ def generate_excel(
     desconto_promo: float,
     aliquota: float,
     spike_day: bool = False,
+    margem_individual: bool = False,
+    tacos_pct: float = 0.0,
+    afiliado_pct: float = 0.0,
 ) -> bytes:
-    """Gera um Excel com formatação profissional e retorna bytes."""
+    """Gera um Excel com formatação profissional e retorna bytes.
+
+    A coluna ``Margem %`` é construída a partir de ``df["Margem Real"]`` —
+    portanto reflete a margem específica de cada produto quando o usuário
+    está usando o modo "Margem por linha".
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Precificação Shopee"
@@ -301,23 +394,16 @@ def generate_excel(
     ROXO_MED = "2d0a52"
     DOURADO   = "D4AF37"
     BRANCO    = "FFFFFF"
-    VERDE     = "1DB954"
-    VERMELHO  = "E74C3C"
-    CINZA_CL  = "F0E6FF"
 
     fill_header  = PatternFill("solid", fgColor=ROXO_MED)
     fill_title   = PatternFill("solid", fgColor=ROXO_ESC)
     fill_params  = PatternFill("solid", fgColor="0f0120")
-    fill_ok      = PatternFill("solid", fgColor="0a2e1a")
-    fill_nok     = PatternFill("solid", fgColor="2e0a0a")
     fill_row_alt = PatternFill("solid", fgColor="1f063b")
 
     font_title   = Font(name="Calibri", bold=True, size=14, color=DOURADO)
     font_header  = Font(name="Calibri", bold=True, size=10, color=DOURADO)
     font_data    = Font(name="Calibri", size=10, color=BRANCO)
     font_params  = Font(name="Calibri", size=10, color="c8a8e9")
-    font_ok      = Font(name="Calibri", size=10, color=VERDE, bold=True)
-    font_nok     = Font(name="Calibri", size=10, color=VERMELHO, bold=True)
 
     thin_gold    = Border(
         left=Side(style="thin", color=DOURADO),
@@ -329,23 +415,33 @@ def generate_excel(
     left_align   = Alignment(horizontal="left", vertical="center")
 
     # ── Linha 1: Título ──
-    ws.merge_cells("A1:H1")
+    ws.merge_cells("A1:J1")
     ws["A1"] = "SHOPEE PRICE CALCULATOR"
     ws["A1"].font = font_title
     ws["A1"].fill = fill_title
     ws["A1"].alignment = center_align
     ws.row_dimensions[1].height = 30
 
-    # ── Linhas 2-5: Parâmetros ──
+    # ── Linhas 2-6: Parâmetros ──
+    margem_label = (
+        f"{margem*100:.1f}% (geral — ver coluna Margem %)"
+        if margem_individual
+        else f"{margem*100:.1f}%"
+    )
+    tacos_param = f"{tacos_pct * 100:.1f}%" if tacos_pct > 0 else "—"
+    afiliado_param = f"{afiliado_pct * 100:.1f}%" if afiliado_pct > 0 else "—"
     params = [
-        ("Margem Desejada", f"{margem*100:.1f}%"),
+        ("Margem Desejada", margem_label),
+        ("Margem por linha", "Sim" if margem_individual else "Não"),
         ("Desconto Promocional (Fake Price)", f"{desconto_promo*100:.1f}%"),
         ("Imposto sobre Receita", f"{aliquota*100:.2f}%"),
         ("Spike Day", "Ativo" if spike_day else "—"),
+        ("TACOS (anúncios)", tacos_param),
+        ("Comissão de Afiliado", afiliado_param),
     ]
     for i, (label, value) in enumerate(params, start=2):
         ws.merge_cells(f"A{i}:E{i}")
-        ws.merge_cells(f"F{i}:H{i}")
+        ws.merge_cells(f"F{i}:J{i}")
         ws[f"A{i}"] = label
         ws[f"F{i}"] = value
         ws[f"A{i}"].font = font_params
@@ -356,31 +452,35 @@ def generate_excel(
         ws[f"F{i}"].alignment = left_align
         ws.row_dimensions[i].height = 18
 
-    ws.row_dimensions[6].height = 6   # espaço
+    header_row = 2 + len(params) + 1   # linha em branco antes do cabeçalho
+    ws.row_dimensions[header_row - 1].height = 6   # espaço
 
-    # ── Linha 7: Cabeçalhos da tabela ──
+    # ── Cabeçalhos da tabela ──
     data_cols = [
         "ID Produto", "Nome", "Custo (R$)", "Preço Alvo (R$)",
-        "Fake Price (R$)", "Lucro (R$)",
-        "Comissão Shopee (R$)", "Status",
+        "Fake Price (R$)", "Lucro (R$)", "Margem %",
+        "Comissão Shopee (R$)", "TACOS (R$)", "Afiliado (R$)",
     ]
     for col_idx, col_name in enumerate(data_cols, start=1):
-        cell = ws.cell(row=7, column=col_idx, value=col_name)
+        cell = ws.cell(row=header_row, column=col_idx, value=col_name)
         cell.font = font_header
         cell.fill = fill_header
         cell.alignment = center_align
         cell.border = thin_gold
-    ws.row_dimensions[7].height = 22
+    ws.row_dimensions[header_row].height = 22
 
     # ── Linhas de dados ──
     currency_num = '#,##0.00'
     pct_num      = '0.0"%"'
 
-    for row_idx, (_, row) in enumerate(df.iterrows(), start=8):
-        viavel = bool(row["Viável"])
-        fill_row = fill_ok if viavel else fill_nok
+    first_data_row = header_row + 1
+    for row_offset, (_, row) in enumerate(df.iterrows()):
+        row_idx = first_data_row + row_offset
         fill_alt = fill_row_alt if row_idx % 2 == 0 else PatternFill("solid", fgColor="160430")
 
+        margem_real_pct = float(row.get("Margem Real", 0.0)) * 100
+        tacos_val = float(row.get("TACOS (R$)", 0.0) or 0.0)
+        afiliado_val = float(row.get("Afiliado (R$)", 0.0) or 0.0)
         values = [
             row["ID Produto"],
             row["Nome"],
@@ -388,13 +488,16 @@ def generate_excel(
             row["Preço Alvo (R$)"],
             row["Fake Price (R$)"],
             row["Lucro (R$)"],
+            margem_real_pct,
             row["Comissão Shopee (R$)"],
-            "✔ OK" if viavel else "⚠ Revisar",
+            tacos_val,
+            afiliado_val,
         ]
         formats = [
             None, None,
             currency_num, currency_num, currency_num,
-            currency_num, currency_num, None,
+            currency_num, pct_num, currency_num,
+            currency_num, currency_num,
         ]
 
         for col_idx, (val, fmt) in enumerate(zip(values, formats), start=1):
@@ -406,22 +509,19 @@ def generate_excel(
                 right=Side(style="thin", color="3d1562"),
                 bottom=Side(style="thin", color="3d1562"),
             )
-            if col_idx == 8:
-                cell.font = font_ok if viavel else font_nok
-            else:
-                cell.font = font_data
+            cell.font = font_data
             if fmt:
                 cell.number_format = fmt
 
         ws.row_dimensions[row_idx].height = 18
 
     # ── Largura das colunas ──
-    col_widths = [14, 24, 14, 16, 16, 14, 20, 12]
+    col_widths = [14, 24, 14, 16, 16, 14, 12, 20, 14, 14]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     # ── Freeze panes ──
-    ws.freeze_panes = "A8"
+    ws.freeze_panes = f"A{first_data_row}"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -458,11 +558,21 @@ def generate_template_excel() -> bytes:
 with st.sidebar:
     st.markdown(SIDEBAR_HEADER_HTML, unsafe_allow_html=True)
 
-    st.markdown("**Margem de Lucro**")
+    st.markdown("**Margem de Lucro Geral**")
     margem_pct = st.slider(
-        "Margem (%)", min_value=5, max_value=80, value=10, step=1,
+        "Margem (%)", min_value=0, max_value=50, value=10, step=1,
         label_visibility="collapsed",
-        help="Margem sobre o preço total de venda. Ex: 10% = o lucro será 10% do preço cobrado (uma fatia limpa da pizza).",
+        help="Margem sobre o preço total de venda aplicada a todos os produtos. "
+             "Ex: 10% = o lucro será 10% do preço cobrado (uma fatia limpa da pizza).",
+    )
+
+    margem_individual = st.toggle(
+        "Margem específica",
+        value=False,
+        help="Quando ativo, a tabela passa a permitir editar a margem de cada "
+             "linha individualmente. Cada linha começa com o valor da "
+             "Margem de Lucro Geral acima e você ajusta apenas as que quiser. "
+             "Desligar e ligar novamente restaura todas para a margem geral atual.",
     )
 
     st.markdown("**Desconto Fake Price**")
@@ -477,6 +587,22 @@ with st.sidebar:
         "Imposto (%)", min_value=0, max_value=50, value=10, step=1,
         label_visibility="collapsed",
         help="Alíquota de imposto sobre a receita bruta (ex: Simples Nacional, Lucro Presumido)",
+    )
+
+    st.markdown("**TACOS (Anúncios)**")
+    tacos_pct_input = st.slider(
+        "TACOS (%)", min_value=0, max_value=50, value=0, step=1,
+        label_visibility="collapsed",
+        help="Total Advertising Cost of Sales — percentual do preço gasto com anúncios (Shopee Ads). "
+             "Deixe em 0 se não anuncia.",
+    )
+
+    st.markdown("**Comissão de Afiliado**")
+    afiliado_pct_input = st.slider(
+        "Afiliado (%)", min_value=0, max_value=50, value=0, step=1,
+        label_visibility="collapsed",
+        help="Percentual do preço pago a afiliados que indicam o produto. "
+             "Deixe em 0 se não usa programa de afiliados.",
     )
 
     st.divider()
@@ -499,6 +625,8 @@ with st.sidebar:
 margem         = margem_pct / 100
 desconto_promo = promo_pct / 100
 aliquota       = aliquota_pct / 100
+tacos          = tacos_pct_input / 100
+afiliado       = afiliado_pct_input / 100
 
 # ── Cabeçalho principal ───────────────────────────────────────────────────────
 st.markdown(TITLE_HTML, unsafe_allow_html=True)
@@ -553,10 +681,49 @@ if uploaded is not None:
     if "last_file" not in st.session_state or st.session_state.last_file != uploaded.name:
         st.session_state.last_file = uploaded.name
         st.session_state.df_raw = parse_excel(uploaded)
+        # Ao trocar de arquivo, descarta margens individuais antigas
+        st.session_state.pop("margens_override", None)
 
     df_raw = st.session_state.get("df_raw")
 
     if df_raw is not None and len(df_raw) > 0:
+
+        # ── Margens individuais por produto ────────────────────────────────
+        # Comportamento:
+        #   • Toggle ligado pela primeira vez (ou após desligar): inicializa
+        #     todas as linhas com o valor atual da Margem de Lucro Geral.
+        #   • Toggle ligado e mantido ligado: preserva as edições do usuário;
+        #     produtos novos (raro) recebem a margem geral como default.
+        #   • Toggle desligado: descarta os overrides (volta a usar a margem
+        #     geral para todos os produtos).
+        prev_individual = st.session_state.get("margem_individual_prev", False)
+        if margem_individual:
+            just_turned_on = not prev_individual
+            if just_turned_on or "margens_override" not in st.session_state:
+                st.session_state.margens_override = {
+                    str(pid): float(margem_pct)
+                    for pid in df_raw["id"].astype(str)
+                }
+                # Bump no seed faz o data_editor remontar limpo, evitando que
+                # edits antigos sejam reaplicados por cima dos novos defaults.
+                st.session_state["editor_seed"] = (
+                    st.session_state.get("editor_seed", 0) + 1
+                )
+            else:
+                # Mantém edições; garante default para produtos novos
+                for pid in df_raw["id"].astype(str):
+                    st.session_state.margens_override.setdefault(
+                        str(pid), float(margem_pct)
+                    )
+            margens_override = {
+                pid: m / 100.0
+                for pid, m in st.session_state.margens_override.items()
+            }
+        else:
+            # Toggle desligado: descarta overrides
+            st.session_state.pop("margens_override", None)
+            margens_override = None
+        st.session_state["margem_individual_prev"] = margem_individual
 
         df_results = build_results_df(
             df_raw=df_raw,
@@ -564,6 +731,9 @@ if uploaded is not None:
             margem=margem,
             desconto_promo=desconto_promo,
             aliquota_imposto=aliquota + spike_day_rate,
+            tacos_pct=tacos,
+            afiliado_pct=afiliado,
+            margens_override=margens_override,
         )
 
         # ── Tabela de resultados ────────────────────────────────────────────
@@ -573,9 +743,13 @@ if uploaded is not None:
         )
 
         # Parâmetros exibidos como badges
+        margem_label = (
+            f"Margem {margem_pct}% (geral)" if margem_individual
+            else f"Margem {margem_pct}%"
+        )
         badges_html = (
             f"Parâmetros ativos: "
-            + badge_html(f"Margem {margem_pct}%")
+            + badge_html(margem_label)
             + " &nbsp; "
             + badge_html(f"Promo {promo_pct}%", "#7B2FBE")
             + " &nbsp; "
@@ -583,39 +757,128 @@ if uploaded is not None:
         )
         if spike_day:
             badges_html += " &nbsp; " + badge_html("Spike Day +3,5%", "#E67E22")
+        if tacos_pct_input > 0:
+            badges_html += " &nbsp; " + badge_html(f"TACOS {tacos_pct_input}%", "#C0392B")
+        if afiliado_pct_input > 0:
+            badges_html += " &nbsp; " + badge_html(f"Afiliado {afiliado_pct_input}%", "#8E44AD")
+        if margem_individual:
+            badges_html += " &nbsp; " + badge_html("Margem por linha", "#D4AF37")
         st.markdown(badges_html, unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
         # Formata o DataFrame para exibição
-        display_df = df_results.drop(
-            columns=[
-                "Viável", "Break-Even (R$)", "Taxa Fixa Shopee (R$)",
-                "Imposto (R$)", "Margem Real",
+        cols_to_drop = [
+            "Viável", "Break-Even (R$)", "Taxa Fixa Shopee (R$)",
+            "Imposto (R$)", "Margem Real",
+        ]
+        # Só exibe TACOS / Afiliado na tabela quando o usuário tiver definido > 0
+        if tacos_pct_input == 0:
+            cols_to_drop.append("TACOS (R$)")
+        if afiliado_pct_input == 0:
+            cols_to_drop.append("Afiliado (R$)")
+
+        display_df = df_results.drop(columns=cols_to_drop).copy()
+
+        # ── Modo edição (margem por linha) ─────────────────────────────────
+        if margem_individual:
+            st.markdown(
+                "<div style='color:#D4AF37; font-size:0.85rem; margin-bottom:6px;'>"
+                "✏️ <b>Modo edição:</b> ajuste a coluna <b>Margem %</b> de cada "
+                "linha. Os preços recalculam automaticamente."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Insere a coluna Margem % editável logo após o Nome
+            edit_df = display_df.copy()
+            margem_col = [
+                float(st.session_state.margens_override[str(pid)])
+                for pid in df_results["ID Produto"]
             ]
-        ).copy()
+            insert_at = min(2, len(edit_df.columns))
+            edit_df.insert(loc=insert_at, column="Margem %", value=margem_col)
 
-        # Formatação condicional por margem (cor de fundo via Styler)
-        def color_rows(row):
-            return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
+            col_config: dict = {}
+            for c in edit_df.columns:
+                if c == "Margem %":
+                    col_config[c] = st.column_config.NumberColumn(
+                        "Margem %",
+                        min_value=0,
+                        max_value=50,
+                        step=1,
+                        format="%d%%",
+                        help="Margem específica desta linha (0–50%). "
+                             "Editável.",
+                    )
+                elif c.endswith("(R$)"):
+                    col_config[c] = st.column_config.NumberColumn(
+                        c,
+                        format="R$ %.2f",
+                        disabled=True,
+                    )
+                else:
+                    col_config[c] = st.column_config.Column(c, disabled=True)
 
-        styled = (
-            display_df.style
-            .apply(color_rows, axis=1)
-            .format({
+            # Seed na chave permite "remontar" o widget após restaurar
+            # margens individuais (evita que edits antigos sejam reaplicados
+            # por cima dos defaults após o reset).
+            editor_seed = st.session_state.get("editor_seed", 0)
+            edited = st.data_editor(
+                edit_df,
+                column_config=col_config,
+                hide_index=True,
+                use_container_width=True,
+                height=420,
+                key=f"editor_margens_{st.session_state.last_file}_{editor_seed}",
+            )
+
+            # Captura mudanças e dispara recálculo
+            changed = False
+            for pid, m in zip(df_results["ID Produto"], edited["Margem %"]):
+                pid_s = str(pid)
+                try:
+                    new_m = float(m) if m is not None else float(margem_pct)
+                except (TypeError, ValueError):
+                    new_m = float(margem_pct)
+                new_m = max(0.0, min(50.0, new_m))
+                if (
+                    abs(st.session_state.margens_override.get(pid_s, -1) - new_m)
+                    > 1e-9
+                ):
+                    st.session_state.margens_override[pid_s] = new_m
+                    changed = True
+
+            if changed:
+                st.rerun()
+        else:
+            # Formatação condicional por margem (cor de fundo via Styler)
+            def color_rows(row):
+                return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
+
+            fmt_map = {
                 "Custo (R$)":          "R$ {:,.2f}",
                 "Preço Alvo (R$)":     "R$ {:,.2f}",
                 "Fake Price (R$)":     "R$ {:,.2f}",
                 "Lucro (R$)":          "R$ {:,.2f}",
                 "Comissão Shopee (R$)":"R$ {:,.2f}",
-            })
-            .set_properties(**{
-                "text-align": "center",
-                "font-size": "0.88rem",
-            })
-            .set_properties(subset=["Nome"], **{"text-align": "left"})
-        )
+            }
+            if tacos_pct_input > 0:
+                fmt_map["TACOS (R$)"] = "R$ {:,.2f}"
+            if afiliado_pct_input > 0:
+                fmt_map["Afiliado (R$)"] = "R$ {:,.2f}"
 
-        st.dataframe(styled, use_container_width=True, height=420)
+            styled = (
+                display_df.style
+                .apply(color_rows, axis=1)
+                .format(fmt_map)
+                .set_properties(**{
+                    "text-align": "center",
+                    "font-size": "0.88rem",
+                })
+                .set_properties(subset=["Nome"], **{"text-align": "left"})
+            )
+
+            st.dataframe(styled, use_container_width=True, height=420)
 
         # ── Breakdown de custos do primeiro produto ────────────────────────
         if len(df_results) > 0:
@@ -633,6 +896,9 @@ if uploaded is not None:
             desconto_promo=desconto_promo,
             aliquota=aliquota,
             spike_day=spike_day,
+            margem_individual=margem_individual,
+            tacos_pct=tacos,
+            afiliado_pct=afiliado,
         )
 
         col_dl, col_info = st.columns([1, 3])
