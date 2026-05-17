@@ -66,7 +66,7 @@ def parse_br_currency(value) -> float:
     if not s or s.lower() in ("nan", "none", "-"):
         return 0.0
 
-    s = re.sub(r"[R$\s]", "", s, flags=re.I)
+    s = re.sub(r"[R$%\s]", "", s, flags=re.I)
     if not s:
         return 0.0
 
@@ -583,11 +583,19 @@ with st.sidebar:
     )
 
     st.markdown("**Imposto sobre Receita**")
-    aliquota_pct = st.slider(
-        "Imposto (%)", min_value=0, max_value=50, value=10, step=1,
-        label_visibility="collapsed",
-        help="Alíquota de imposto sobre a receita bruta (ex: Simples Nacional, Lucro Presumido)",
-    )
+    col_imposto, _ = st.columns([1, 2])
+    with col_imposto:
+        aliquota_input = st.text_input(
+            "Imposto (%)",
+            value="10,0",
+            label_visibility="collapsed",
+            help="Digite a alíquota de imposto sobre a receita bruta. Ex: 11,5 ou 6,73.",
+        )
+    aliquota_pct = max(0.0, min(50.0, parse_br_currency(aliquota_input)))
+    if aliquota_input and aliquota_pct in (0.0, 50.0):
+        imposto_digitado = parse_br_currency(aliquota_input)
+        if imposto_digitado < 0 or imposto_digitado > 50:
+            st.caption("Imposto limitado entre 0% e 50%.")
 
     st.markdown("**TACOS (Anúncios)**")
     tacos_pct_input = st.slider(
@@ -766,6 +774,27 @@ if uploaded is not None:
         st.markdown(badges_html, unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
+        busca_produto = st.text_input(
+            "Pesquisar por ID ou Nome",
+            placeholder="Digite o ID ou nome do produto...",
+            help="Filtra a tabela pelo ID Produto ou pelo Nome. A exportação continua incluindo todos os produtos.",
+        ).strip()
+        if busca_produto:
+            mask_busca = (
+                df_results["ID Produto"].astype(str).str.contains(
+                    busca_produto, case=False, na=False, regex=False
+                )
+                | df_results["Nome"].astype(str).str.contains(
+                    busca_produto, case=False, na=False, regex=False
+                )
+            )
+            df_table = df_results[mask_busca].copy()
+            st.caption(
+                f"{len(df_table)} de {len(df_results)} produto(s) encontrado(s)."
+            )
+        else:
+            df_table = df_results
+
         # Formata o DataFrame para exibição
         cols_to_drop = [
             "Viável", "Break-Even (R$)", "Taxa Fixa Shopee (R$)",
@@ -777,7 +806,7 @@ if uploaded is not None:
         if afiliado_pct_input == 0:
             cols_to_drop.append("Afiliado (R$)")
 
-        display_df = df_results.drop(columns=cols_to_drop).copy()
+        display_df = df_table.drop(columns=cols_to_drop).copy()
 
         # ── Modo edição (margem por linha) ─────────────────────────────────
         if margem_individual:
@@ -793,7 +822,7 @@ if uploaded is not None:
             edit_df = display_df.copy()
             margem_col = [
                 float(st.session_state.margens_override[str(pid)])
-                for pid in df_results["ID Produto"]
+                for pid in df_table["ID Produto"]
             ]
             insert_at = min(2, len(edit_df.columns))
             edit_df.insert(loc=insert_at, column="Margem %", value=margem_col)
@@ -834,7 +863,7 @@ if uploaded is not None:
 
             # Captura mudanças e dispara recálculo
             changed = False
-            for pid, m in zip(df_results["ID Produto"], edited["Margem %"]):
+            for pid, m in zip(df_table["ID Produto"], edited["Margem %"]):
                 pid_s = str(pid)
                 try:
                     new_m = float(m) if m is not None else float(margem_pct)
@@ -881,8 +910,8 @@ if uploaded is not None:
             st.dataframe(styled, use_container_width=True, height=420)
 
         # ── Breakdown de custos do primeiro produto ────────────────────────
-        if len(df_results) > 0:
-            render_cost_breakdown(df_results.iloc[0])
+        if len(df_table) > 0:
+            render_cost_breakdown(df_table.iloc[0])
 
         # ── Exportação ─────────────────────────────────────────────────────
         st.markdown(
