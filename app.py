@@ -17,6 +17,7 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 from pricing import calcular_preco
+from fees import SHOPEE_FEE_TIERS
 from styles import (
     CUSTOM_CSS, TITLE_HTML, SIDEBAR_HEADER_HTML,
     section_header, badge_html,
@@ -368,6 +369,106 @@ def build_results_df(
     return pd.DataFrame(rows)
 
 
+def parse_shopee_excel(file) -> pd.DataFrame | None:
+    """
+    Lê o arquivo de exportação em massa de produtos da Shopee.
+
+    O arquivo exportado pela Shopee tem 3 linhas de metadados/instruções
+    antes dos dados reais, e usa nomes de coluna internos (et_title_*).
+
+    Retorna um DataFrame com: id, preco_shopee.
+    """
+    try:
+        df = pd.read_excel(file, dtype=str, engine="calamine")
+        # As 3 primeiras linhas são metadados/instruções — pula elas
+        df = df.iloc[3:].reset_index(drop=True)
+
+        # Renomeia colunas internas para nomes padronizados
+        df = df.rename(columns={
+            "et_title_product_id":    "id",
+            "et_title_product_name":  "nome_shopee",
+            "et_title_variation_price": "preco_shopee",
+        })
+
+        missing = [c for c in ("id", "preco_shopee") if c not in df.columns]
+        if missing:
+            st.error(
+                "❌ Formato inesperado do arquivo Shopee. "
+                "Use o arquivo de 'Atualização em massa de produtos' exportado diretamente da Shopee."
+            )
+            return None
+
+        df["id"] = df["id"].astype(str).str.strip()
+        df["preco_shopee"] = df["preco_shopee"].map(parse_br_currency)
+
+        # Remove linhas sem ID válido ou sem preço
+        df = df[
+            df["id"].notna()
+            & ~df["id"].isin(["nan", "None", ""])
+            & (df["preco_shopee"] > 0)
+        ]
+
+        # Se um produto tem múltiplas variantes, mantém a maior (mais conservador)
+        df = df.sort_values("preco_shopee", ascending=False)
+        df = df.drop_duplicates(subset="id", keep="first")
+
+        return df[["id", "preco_shopee"]].reset_index(drop=True)
+
+    except Exception as e:
+        st.error(f"❌ Erro ao ler o arquivo Shopee: {e}")
+        return None
+
+
+def build_diagnostico_df(
+    df_raw: pd.DataFrame,
+    df_shopee: pd.DataFrame,
+    aliquota_imposto: float,
+    tacos_pct: float = 0.0,
+    afiliado_pct: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Cruza a planilha de custos com os preços atuais da Shopee e calcula
+    a margem real que cada produto está gerando hoje com o preço atual.
+    """
+    merged = df_raw[["id", "nome", "custo"]].merge(
+        df_shopee[["id", "preco_shopee"]],
+        on="id",
+        how="inner",
+    )
+
+    rows = []
+    for p in merged.to_dict("records"):
+        custo = float(p.get("custo") or 0.0)
+        P = float(p.get("preco_shopee") or 0.0)
+        if P <= 0:
+            continue
+
+        tier = SHOPEE_FEE_TIERS[0]
+        for t in SHOPEE_FEE_TIERS:
+            if t.price_min <= P <= t.price_max:
+                tier = t
+                break
+
+        commission = P * tier.commission_pct + tier.fixed_fee
+        imposto_val = P * aliquota_imposto
+        tacos_val   = P * tacos_pct
+        afil_val    = P * afiliado_pct
+        lucro = P - custo - commission - imposto_val - tacos_val - afil_val
+        margem = lucro / P * 100
+
+        rows.append({
+            "ID Produto":        str(p.get("id", "")),
+            "Nome":              str(p.get("nome", "")),
+            "Custo (R$)":        round(custo, 2),
+            "Preço Shopee (R$)": round(P, 2),
+            "Comissão (R$)":     round(commission, 2),
+            "Lucro Atual (R$)":  round(lucro, 2),
+            "Margem Atual (%)":  round(margem, 2),
+        })
+
+    return pd.DataFrame(rows)
+
+
 # ── Exportação Excel ──────────────────────────────────────────────────────────
 def generate_excel(
     df: pd.DataFrame,
@@ -378,6 +479,7 @@ def generate_excel(
     margem_individual: bool = False,
     tacos_pct: float = 0.0,
     afiliado_pct: float = 0.0,
+    df_diagnostico: pd.DataFrame | None = None,
 ) -> bytes:
     """Gera um Excel com formatação profissional e retorna bytes.
 
@@ -522,6 +624,101 @@ def generate_excel(
 
     # ── Freeze panes ──
     ws.freeze_panes = f"A{first_data_row}"
+
+    # ── Aba 2: Diagnóstico de Preços Atuais (opcional) ──────────────────────────
+    if df_diagnostico is not None and len(df_diagnostico) > 0:
+        ws2 = wb.create_sheet(title="Diagnóstico Atual")
+
+        DOURADO2  = "D4AF37"
+        ROXO_ESC2 = "1a0533"
+        ROXO_MED2 = "2d0a52"
+        BRANCO2   = "FFFFFF"
+        VERMELHO2 = "E74C3C"
+
+        fill_title2  = PatternFill("solid", fgColor=ROXO_ESC2)
+        fill_header2 = PatternFill("solid", fgColor=ROXO_MED2)
+        fill_normal2 = PatternFill("solid", fgColor="1f063b")
+        fill_alt2    = PatternFill("solid", fgColor="160430")
+        fill_neg2    = PatternFill("solid", fgColor="2e0a0a")
+
+        font_title2  = Font(name="Calibri", bold=True, size=14, color=DOURADO2)
+        font_header2 = Font(name="Calibri", bold=True, size=10, color=DOURADO2)
+        font_data2   = Font(name="Calibri", size=10, color=BRANCO2)
+        font_neg2    = Font(name="Calibri", size=10, color=VERMELHO2, bold=True)
+
+        thin_gold2 = Border(
+            left=Side(style="thin", color=DOURADO2),
+            right=Side(style="thin", color=DOURADO2),
+            top=Side(style="thin", color=DOURADO2),
+            bottom=Side(style="thin", color=DOURADO2),
+        )
+        ca2 = Alignment(horizontal="center", vertical="center")
+        la2 = Alignment(horizontal="left", vertical="center")
+
+        diag_cols = [
+            "ID Produto", "Nome", "Custo (R$)", "Preço Shopee (R$)",
+            "Comissão (R$)", "Lucro Atual (R$)", "Margem Atual (%)",
+        ]
+        n_cols2 = len(diag_cols)
+
+        ws2.merge_cells(f"A1:{get_column_letter(n_cols2)}1")
+        ws2["A1"] = "DIAGNÓSTICO DE PREÇOS ATUAIS"
+        ws2["A1"].font = font_title2
+        ws2["A1"].fill = fill_title2
+        ws2["A1"].alignment = ca2
+        ws2.row_dimensions[1].height = 30
+
+        for ci, col_name in enumerate(diag_cols, start=1):
+            cell = ws2.cell(row=2, column=ci, value=col_name)
+            cell.font = font_header2
+            cell.fill = fill_header2
+            cell.alignment = ca2
+            cell.border = thin_gold2
+        ws2.row_dimensions[2].height = 22
+
+        currency_num2 = '#,##0.00'
+        pct_num2      = '0.00"%"'
+
+        for ri, (_, row2) in enumerate(df_diagnostico.iterrows(), start=3):
+            margem_val = float(row2.get("Margem Atual (%)", 0.0))
+            negativo = margem_val < 0
+            fill_row2 = fill_neg2 if negativo else (
+                fill_alt2 if ri % 2 == 0 else fill_normal2
+            )
+
+            values2 = [
+                row2["ID Produto"],
+                row2["Nome"],
+                row2["Custo (R$)"],
+                row2["Preço Shopee (R$)"],
+                row2["Comissão (R$)"],
+                row2["Lucro Atual (R$)"],
+                margem_val,
+            ]
+            formats2 = [
+                None, None,
+                currency_num2, currency_num2, currency_num2,
+                currency_num2, pct_num2,
+            ]
+
+            for ci, (val, fmt) in enumerate(zip(values2, formats2), start=1):
+                cell = ws2.cell(row=ri, column=ci, value=val)
+                cell.fill = fill_row2
+                cell.alignment = ca2 if ci != 2 else la2
+                cell.border = Border(
+                    left=Side(style="thin", color="3d1562"),
+                    right=Side(style="thin", color="3d1562"),
+                    bottom=Side(style="thin", color="3d1562"),
+                )
+                cell.font = font_neg2 if (negativo and ci == n_cols2) else font_data2
+                if fmt:
+                    cell.number_format = fmt
+            ws2.row_dimensions[ri].height = 18
+
+        col_widths2 = [16, 32, 14, 16, 14, 16, 14]
+        for i2, w2 in enumerate(col_widths2, start=1):
+            ws2.column_dimensions[get_column_letter(i2)].width = w2
+        ws2.freeze_panes = "A3"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -946,6 +1143,179 @@ if uploaded is not None:
                 "</div>",
                 unsafe_allow_html=True,
             )
+
+        # ── Diagnóstico de Preços Atuais ────────────────────────────────────
+        st.divider()
+        st.markdown(
+            section_header("Diagnóstico de Preços Atuais (Shopee)", "🔍"),
+            unsafe_allow_html=True,
+        )
+
+        col_up_s, col_hint_s = st.columns([2, 3])
+        with col_up_s:
+            uploaded_shopee = st.file_uploader(
+                "Planilha Shopee",
+                type=["xlsx", "xls"],
+                key="shopee_uploader",
+                label_visibility="collapsed",
+            )
+        with col_hint_s:
+            st.markdown(
+                "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
+                " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
+                "<b style='color:#D4AF37'>Como usar:</b><br>"
+                "Exporte a planilha de <b>Atualização em massa de produtos</b> "
+                "diretamente da Shopee e faça o upload aqui.<br>"
+                "O <code style='color:#e8d5ff'>ID</code> da sua planilha de custos "
+                "deve ser o <b style='color:#e8d5ff'>ID do Produto</b> na Shopee."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        if uploaded_shopee is not None:
+            if (
+                "shopee_file" not in st.session_state
+                or st.session_state.shopee_file != uploaded_shopee.name
+            ):
+                st.session_state.shopee_file = uploaded_shopee.name
+                st.session_state.df_shopee = parse_shopee_excel(uploaded_shopee)
+
+            df_shopee = st.session_state.get("df_shopee")
+
+            if df_shopee is not None and len(df_shopee) > 0:
+                df_diag = build_diagnostico_df(
+                    df_raw=df_raw,
+                    df_shopee=df_shopee,
+                    aliquota_imposto=aliquota + spike_day_rate,
+                    tacos_pct=tacos,
+                    afiliado_pct=afiliado,
+                )
+
+                if len(df_diag) == 0:
+                    st.warning(
+                        "⚠️ Nenhum produto correspondente encontrado. "
+                        "Verifique se o ID da planilha de custos coincide "
+                        "com o ID do Produto na Shopee."
+                    )
+                else:
+                    n_matched = len(df_diag)
+                    n_total   = len(df_raw)
+                    st.caption(
+                        f"{n_matched} de {n_total} produto(s) com preço Shopee encontrado(s)."
+                    )
+
+                    # ── Filtros ──────────────────────────────────────────────
+                    col_busca, col_op, col_pct = st.columns([3, 1, 1])
+
+                    with col_busca:
+                        busca_diag = st.text_input(
+                            "Pesquisar por ID ou Nome",
+                            placeholder="Digite o ID ou nome do produto...",
+                            key="busca_diag",
+                        ).strip()
+
+                    with col_op:
+                        operador = st.selectbox(
+                            "Filtro de margem",
+                            options=["Todos", "< menor que", "> maior que"],
+                            key="op_margem_diag",
+                            label_visibility="visible",
+                        )
+
+                    with col_pct:
+                        filtro_pct_txt = st.text_input(
+                            "Margem (%)",
+                            placeholder="Ex: 10",
+                            key="filtro_pct_diag",
+                            disabled=(operador == "Todos"),
+                            label_visibility="visible",
+                        )
+
+                    # Aplica busca por texto
+                    df_diag_view = df_diag.copy()
+                    if busca_diag:
+                        mask_busca = (
+                            df_diag_view["ID Produto"].astype(str).str.contains(
+                                busca_diag, case=False, na=False, regex=False
+                            )
+                            | df_diag_view["Nome"].astype(str).str.contains(
+                                busca_diag, case=False, na=False, regex=False
+                            )
+                        )
+                        df_diag_view = df_diag_view[mask_busca]
+
+                    # Aplica filtro de margem
+                    filtro_margem: float | None = None
+                    if operador != "Todos" and filtro_pct_txt.strip():
+                        try:
+                            filtro_margem = parse_br_currency(filtro_pct_txt)
+                        except Exception:
+                            filtro_margem = None
+
+                    if filtro_margem is not None:
+                        if operador == "< menor que":
+                            df_diag_view = df_diag_view[
+                                df_diag_view["Margem Atual (%)"] < filtro_margem
+                            ]
+                        else:
+                            df_diag_view = df_diag_view[
+                                df_diag_view["Margem Atual (%)"] > filtro_margem
+                            ]
+
+                    # Legenda dos filtros ativos
+                    partes = []
+                    if busca_diag:
+                        partes.append(f'busca: "{busca_diag}"')
+                    if filtro_margem is not None:
+                        sinal = "<" if operador == "< menor que" else ">"
+                        partes.append(f"margem {sinal} {filtro_margem:.1f}%")
+                    if partes:
+                        st.caption(
+                            f"{len(df_diag_view)} produto(s) · filtro: {', '.join(partes)}."
+                        )
+
+                    def color_diag(row):
+                        if row["Margem Atual (%)"] < 0:
+                            return ["background-color: #2e0a0a; color: #FFFFFF"] * len(row)
+                        return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
+
+                    styled_diag = (
+                        df_diag_view.style
+                        .apply(color_diag, axis=1)
+                        .format({
+                            "Custo (R$)":         "R$ {:,.2f}",
+                            "Preço Shopee (R$)":  "R$ {:,.2f}",
+                            "Comissão (R$)":      "R$ {:,.2f}",
+                            "Lucro Atual (R$)":   "R$ {:,.2f}",
+                            "Margem Atual (%)":   "{:.2f}%",
+                        })
+                        .set_properties(**{
+                            "text-align": "center",
+                            "font-size": "0.88rem",
+                        })
+                        .set_properties(subset=["Nome"], **{"text-align": "left"})
+                    )
+                    st.dataframe(styled_diag, use_container_width=True, height=420)
+
+                    # Download Excel com aba de diagnóstico
+                    excel_diag_bytes = generate_excel(
+                        df=df_results,
+                        margem=margem,
+                        desconto_promo=desconto_promo,
+                        aliquota=aliquota,
+                        spike_day=spike_day,
+                        margem_individual=margem_individual,
+                        tacos_pct=tacos,
+                        afiliado_pct=afiliado,
+                        df_diagnostico=df_diag,
+                    )
+                    st.download_button(
+                        label="⬇️ Baixar Excel com Diagnóstico",
+                        data=excel_diag_bytes,
+                        file_name="shopee_precificacao_diagnostico.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help="Exporta as duas abas: Precificação Shopee + Diagnóstico Atual.",
+                    )
 
     elif df_raw is not None and len(df_raw) == 0:
         st.warning("Planilha lida, mas nenhum produto com custo > 0 foi encontrado.")
