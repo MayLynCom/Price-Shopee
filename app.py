@@ -425,10 +425,15 @@ def build_diagnostico_df(
     aliquota_imposto: float,
     tacos_pct: float = 0.0,
     afiliado_pct: float = 0.0,
+    tacos_diag_pct: float = 0.0,
+    desconto_diag_pct: float = 0.0,
 ) -> pd.DataFrame:
     """
     Cruza a planilha de custos com os preços atuais da Shopee e calcula
     a margem real que cada produto está gerando hoje com o preço atual.
+
+    tacos_diag_pct   — TACOS médio atual da conta (% sobre receita efetiva).
+    desconto_diag_pct — desconto/cupom atual aplicado a todos os produtos (%).
     """
     merged = df_raw[["id", "nome", "custo"]].merge(
         df_shopee[["id", "preco_shopee"]],
@@ -439,9 +444,12 @@ def build_diagnostico_df(
     rows = []
     for p in merged.to_dict("records"):
         custo = float(p.get("custo") or 0.0)
-        P = float(p.get("preco_shopee") or 0.0)
-        if P <= 0:
+        P_lista = float(p.get("preco_shopee") or 0.0)
+        if P_lista <= 0:
             continue
+
+        # Preço efetivo após desconto atual
+        P = P_lista * (1.0 - desconto_diag_pct)
 
         tier = SHOPEE_FEE_TIERS[0]
         for t in SHOPEE_FEE_TIERS:
@@ -449,21 +457,23 @@ def build_diagnostico_df(
                 tier = t
                 break
 
-        commission = P * tier.commission_pct + tier.fixed_fee
-        imposto_val = P * aliquota_imposto
-        tacos_val   = P * tacos_pct
-        afil_val    = P * afiliado_pct
+        commission   = P * tier.commission_pct + tier.fixed_fee
+        imposto_val  = P * aliquota_imposto
+        tacos_val    = P * (tacos_pct + tacos_diag_pct)
+        afil_val     = P * afiliado_pct
         lucro = P - custo - commission - imposto_val - tacos_val - afil_val
-        margem = lucro / P * 100
+        margem = lucro / P * 100 if P > 0 else 0.0
 
         rows.append({
-            "ID Produto":        str(p.get("id", "")),
-            "Nome":              str(p.get("nome", "")),
-            "Custo (R$)":        round(custo, 2),
-            "Preço Shopee (R$)": round(P, 2),
-            "Comissão (R$)":     round(commission, 2),
-            "Lucro Atual (R$)":  round(lucro, 2),
-            "Margem Atual (%)":  round(margem, 2),
+            "ID Produto":          str(p.get("id", "")),
+            "Nome":                str(p.get("nome", "")),
+            "Custo (R$)":          round(custo, 2),
+            "Preço Shopee (R$)":   round(P_lista, 2),
+            "Preço Efetivo (R$)":  round(P, 2),
+            "Comissão (R$)":       round(commission, 2),
+            "TACOS (R$)":          round(tacos_val, 2),
+            "Lucro Atual (R$)":    round(lucro, 2),
+            "Margem Atual (%)":    round(margem, 2),
         })
 
     return pd.DataFrame(rows)
@@ -480,6 +490,8 @@ def generate_excel(
     tacos_pct: float = 0.0,
     afiliado_pct: float = 0.0,
     df_diagnostico: pd.DataFrame | None = None,
+    tacos_diag_pct: float = 0.0,
+    desconto_diag_pct: float = 0.0,
 ) -> bytes:
     """Gera um Excel com formatação profissional e retorna bytes.
 
@@ -637,14 +649,18 @@ def generate_excel(
 
         fill_title2  = PatternFill("solid", fgColor=ROXO_ESC2)
         fill_header2 = PatternFill("solid", fgColor=ROXO_MED2)
+        fill_params2 = PatternFill("solid", fgColor="0f0120")
         fill_normal2 = PatternFill("solid", fgColor="1f063b")
         fill_alt2    = PatternFill("solid", fgColor="160430")
         fill_neg2    = PatternFill("solid", fgColor="2e0a0a")
+        fill_media2  = PatternFill("solid", fgColor="0a2010")
 
         font_title2  = Font(name="Calibri", bold=True, size=14, color=DOURADO2)
         font_header2 = Font(name="Calibri", bold=True, size=10, color=DOURADO2)
+        font_params2 = Font(name="Calibri", size=10, color="c8a8e9")
         font_data2   = Font(name="Calibri", size=10, color=BRANCO2)
         font_neg2    = Font(name="Calibri", size=10, color=VERMELHO2, bold=True)
+        font_media2  = Font(name="Calibri", bold=True, size=10, color=DOURADO2)
 
         thin_gold2 = Border(
             left=Side(style="thin", color=DOURADO2),
@@ -652,34 +668,68 @@ def generate_excel(
             top=Side(style="thin", color=DOURADO2),
             bottom=Side(style="thin", color=DOURADO2),
         )
+        thin_dark2 = Border(
+            left=Side(style="thin", color="3d1562"),
+            right=Side(style="thin", color="3d1562"),
+            bottom=Side(style="thin", color="3d1562"),
+        )
         ca2 = Alignment(horizontal="center", vertical="center")
         la2 = Alignment(horizontal="left", vertical="center")
 
         diag_cols = [
             "ID Produto", "Nome", "Custo (R$)", "Preço Shopee (R$)",
-            "Comissão (R$)", "Lucro Atual (R$)", "Margem Atual (%)",
+            "Preço Efetivo (R$)", "Comissão (R$)", "TACOS (R$)",
+            "Lucro Atual (R$)", "Margem Atual (%)",
         ]
         n_cols2 = len(diag_cols)
+        last_col2 = get_column_letter(n_cols2)
 
-        ws2.merge_cells(f"A1:{get_column_letter(n_cols2)}1")
+        # ── Linha 1: Título ──
+        ws2.merge_cells(f"A1:{last_col2}1")
         ws2["A1"] = "DIAGNÓSTICO DE PREÇOS ATUAIS"
         ws2["A1"].font = font_title2
         ws2["A1"].fill = fill_title2
         ws2["A1"].alignment = ca2
         ws2.row_dimensions[1].height = 30
 
+        # ── Linhas 2-4: Parâmetros do diagnóstico ──
+        diag_params = [
+            ("TACOS atual da conta",  f"{tacos_diag_pct * 100:.1f}%" if tacos_diag_pct > 0 else "—"),
+            ("Desconto atual",        f"{desconto_diag_pct * 100:.1f}%" if desconto_diag_pct > 0 else "—"),
+            ("Imposto sobre receita", f"{aliquota * 100:.2f}%"),
+        ]
+        half = n_cols2 // 2
+        for i, (label, value) in enumerate(diag_params, start=2):
+            ws2.merge_cells(f"A{i}:{get_column_letter(half)}{i}")
+            ws2.merge_cells(f"{get_column_letter(half+1)}{i}:{last_col2}{i}")
+            ws2[f"A{i}"] = label
+            ws2[f"{get_column_letter(half+1)}{i}"] = value
+            ws2[f"A{i}"].font = font_params2
+            ws2[f"{get_column_letter(half+1)}{i}"].font = Font(
+                name="Calibri", size=10, color=DOURADO2, bold=True
+            )
+            ws2[f"A{i}"].fill = fill_params2
+            ws2[f"{get_column_letter(half+1)}{i}"].fill = fill_params2
+            ws2[f"A{i}"].alignment = la2
+            ws2[f"{get_column_letter(half+1)}{i}"].alignment = la2
+            ws2.row_dimensions[i].height = 18
+
+        # ── Linha de cabeçalho ──
+        header_row = len(diag_params) + 2
         for ci, col_name in enumerate(diag_cols, start=1):
-            cell = ws2.cell(row=2, column=ci, value=col_name)
+            cell = ws2.cell(row=header_row, column=ci, value=col_name)
             cell.font = font_header2
             cell.fill = fill_header2
             cell.alignment = ca2
             cell.border = thin_gold2
-        ws2.row_dimensions[2].height = 22
+        ws2.row_dimensions[header_row].height = 22
 
         currency_num2 = '#,##0.00'
         pct_num2      = '0.00"%"'
 
-        for ri, (_, row2) in enumerate(df_diagnostico.iterrows(), start=3):
+        first_data2 = header_row + 1
+
+        for ri, (_, row2) in enumerate(df_diagnostico.iterrows(), start=first_data2):
             margem_val = float(row2.get("Margem Atual (%)", 0.0))
             negativo = margem_val < 0
             fill_row2 = fill_neg2 if negativo else (
@@ -689,15 +739,18 @@ def generate_excel(
             values2 = [
                 row2["ID Produto"],
                 row2["Nome"],
-                row2["Custo (R$)"],
-                row2["Preço Shopee (R$)"],
-                row2["Comissão (R$)"],
-                row2["Lucro Atual (R$)"],
+                row2.get("Custo (R$)", 0.0),
+                row2.get("Preço Shopee (R$)", 0.0),
+                row2.get("Preço Efetivo (R$)", row2.get("Preço Shopee (R$)", 0.0)),
+                row2.get("Comissão (R$)", 0.0),
+                row2.get("TACOS (R$)", 0.0),
+                row2.get("Lucro Atual (R$)", 0.0),
                 margem_val,
             ]
             formats2 = [
                 None, None,
                 currency_num2, currency_num2, currency_num2,
+                currency_num2, currency_num2,
                 currency_num2, pct_num2,
             ]
 
@@ -705,20 +758,41 @@ def generate_excel(
                 cell = ws2.cell(row=ri, column=ci, value=val)
                 cell.fill = fill_row2
                 cell.alignment = ca2 if ci != 2 else la2
-                cell.border = Border(
-                    left=Side(style="thin", color="3d1562"),
-                    right=Side(style="thin", color="3d1562"),
-                    bottom=Side(style="thin", color="3d1562"),
-                )
+                cell.border = thin_dark2
                 cell.font = font_neg2 if (negativo and ci == n_cols2) else font_data2
                 if fmt:
                     cell.number_format = fmt
             ws2.row_dimensions[ri].height = 18
 
-        col_widths2 = [16, 32, 14, 16, 14, 16, 14]
+        # ── Linha de rodapé: Margem média ──
+        last_data_row = first_data2 + len(df_diagnostico) - 1
+        media_row = last_data_row + 1
+        media_val = float(df_diagnostico["Margem Atual (%)"].mean())
+        media_neg = media_val < 0
+        fill_media_final = PatternFill("solid", fgColor="2e0a0a") if media_neg else fill_media2
+
+        ws2.merge_cells(f"A{media_row}:{get_column_letter(n_cols2 - 1)}{media_row}")
+        ws2[f"A{media_row}"] = "Margem Média dos Produtos"
+        ws2[f"A{media_row}"].font = font_media2
+        ws2[f"A{media_row}"].fill = fill_media_final
+        ws2[f"A{media_row}"].alignment = la2
+        ws2[f"A{media_row}"].border = thin_gold2
+
+        media_cell = ws2.cell(row=media_row, column=n_cols2, value=media_val)
+        media_cell.font = Font(
+            name="Calibri", bold=True, size=11,
+            color=VERMELHO2 if media_neg else "2ecc71",
+        )
+        media_cell.fill = fill_media_final
+        media_cell.alignment = ca2
+        media_cell.border = thin_gold2
+        media_cell.number_format = pct_num2
+        ws2.row_dimensions[media_row].height = 22
+
+        col_widths2 = [16, 32, 13, 15, 15, 13, 13, 15, 14]
         for i2, w2 in enumerate(col_widths2, start=1):
             ws2.column_dimensions[get_column_letter(i2)].width = w2
-        ws2.freeze_panes = "A3"
+        ws2.freeze_panes = f"A{first_data2}"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1183,12 +1257,44 @@ if uploaded is not None:
             df_shopee = st.session_state.get("df_shopee")
 
             if df_shopee is not None and len(df_shopee) > 0:
+
+                # ── Configurações do diagnóstico ───────────────────────────
+                st.markdown(
+                    "<div style='background:#1a0533; border:1px solid #7B2FBE;"
+                    " border-radius:8px; padding:12px 18px; margin-bottom:12px;'>"
+                    "<b style='color:#D4AF37; font-size:0.9rem;'>⚙️ Parâmetros do cenário atual</b>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                col_td, col_dd, col_esp = st.columns([1, 1, 4])
+                with col_td:
+                    tacos_diag_txt = st.text_input(
+                        "TACOS médio atual (%)",
+                        value="0",
+                        key="tacos_diag_input",
+                        help="% do faturamento gasto com anúncios atualmente "
+                             "(ex: 5 = 5%). Soma ao TACOS da barra lateral.",
+                    )
+                with col_dd:
+                    desconto_diag_txt = st.text_input(
+                        "Desconto atual (%)",
+                        value="0",
+                        key="desconto_diag_input",
+                        help="Desconto/cupom aplicado atualmente sobre o preço listado "
+                             "(ex: 10 = 10% de desconto em todos os produtos).",
+                    )
+
+                tacos_diag = min(max(parse_br_currency(tacos_diag_txt) / 100.0, 0.0), 1.0)
+                desconto_diag = min(max(parse_br_currency(desconto_diag_txt) / 100.0, 0.0), 1.0)
+
                 df_diag = build_diagnostico_df(
                     df_raw=df_raw,
                     df_shopee=df_shopee,
                     aliquota_imposto=aliquota + spike_day_rate,
                     tacos_pct=tacos,
                     afiliado_pct=afiliado,
+                    tacos_diag_pct=tacos_diag,
+                    desconto_diag_pct=desconto_diag,
                 )
 
                 if len(df_diag) == 0:
@@ -1274,21 +1380,60 @@ if uploaded is not None:
                             f"{len(df_diag_view)} produto(s) · filtro: {', '.join(partes)}."
                         )
 
+                    # ── Margem média dos produtos visíveis ────────────────────
+                    if len(df_diag_view) > 0:
+                        media_margem = df_diag_view["Margem Atual (%)"].mean()
+                        media_cor  = "#E74C3C" if media_margem < 0 else "#2ecc71"
+                        media_bg   = "#2e0a0a" if media_margem < 0 else "#0a2e16"
+                        media_bord = "#E74C3C" if media_margem < 0 else "#27ae60"
+                        label_filtro = (
+                            f" (dos {len(df_diag_view)} filtrados)"
+                            if (busca_diag or filtro_margem is not None)
+                            else ""
+                        )
+                        st.markdown(
+                            f"<div style='"
+                            f"display:inline-flex; align-items:center; gap:10px;"
+                            f"background:{media_bg}; border:1px solid {media_bord};"
+                            f"border-radius:8px; padding:10px 20px; margin-bottom:10px;"
+                            f"'>"
+                            f"<span style='color:#c8a8e9; font-size:0.85rem;'>"
+                            f"Margem média{label_filtro}</span>"
+                            f"<span style='color:{media_cor}; font-size:1.25rem;"
+                            f" font-weight:700; letter-spacing:0.5px;'>"
+                            f"{media_margem:.2f}%</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
                     def color_diag(row):
                         if row["Margem Atual (%)"] < 0:
                             return ["background-color: #2e0a0a; color: #FFFFFF"] * len(row)
                         return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
 
+                    fmt_diag = {
+                        "Custo (R$)":          "R$ {:,.2f}",
+                        "Preço Shopee (R$)":   "R$ {:,.2f}",
+                        "Preço Efetivo (R$)":  "R$ {:,.2f}",
+                        "Comissão (R$)":       "R$ {:,.2f}",
+                        "TACOS (R$)":          "R$ {:,.2f}",
+                        "Lucro Atual (R$)":    "R$ {:,.2f}",
+                        "Margem Atual (%)":    "{:.2f}%",
+                    }
+                    # Oculta "Preço Efetivo" se não há desconto e "TACOS" se não há tacos
+                    cols_drop_diag = []
+                    if desconto_diag == 0.0:
+                        cols_drop_diag.append("Preço Efetivo (R$)")
+                    if tacos_diag == 0.0 and tacos == 0.0:
+                        cols_drop_diag.append("TACOS (R$)")
+                    diag_display = df_diag_view.drop(
+                        columns=[c for c in cols_drop_diag if c in df_diag_view.columns],
+                    )
+
                     styled_diag = (
-                        df_diag_view.style
+                        diag_display.style
                         .apply(color_diag, axis=1)
-                        .format({
-                            "Custo (R$)":         "R$ {:,.2f}",
-                            "Preço Shopee (R$)":  "R$ {:,.2f}",
-                            "Comissão (R$)":      "R$ {:,.2f}",
-                            "Lucro Atual (R$)":   "R$ {:,.2f}",
-                            "Margem Atual (%)":   "{:.2f}%",
-                        })
+                        .format({k: v for k, v in fmt_diag.items() if k in diag_display.columns})
                         .set_properties(**{
                             "text-align": "center",
                             "font-size": "0.88rem",
@@ -1308,6 +1453,8 @@ if uploaded is not None:
                         tacos_pct=tacos,
                         afiliado_pct=afiliado,
                         df_diagnostico=df_diag,
+                        tacos_diag_pct=tacos_diag,
+                        desconto_diag_pct=desconto_diag,
                     )
                     st.download_button(
                         label="⬇️ Baixar Excel com Diagnóstico",
