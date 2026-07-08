@@ -271,9 +271,12 @@ def parse_excel(file) -> pd.DataFrame | None:
         df.columns = [str(c).strip().lower() for c in df.columns]
 
         col_map = {
-            "id": ["id", "id_produto", "sku", "código", "codigo", "cod"],
-            "nome": ["nome", "nome_produto", "produto", "descrição", "descricao", "name"],
-            "custo": ["custo", "custo_produto", "cost", "costo", "valor_custo", "custo (r$)"],
+            "id": ["id", "id_produto", "sku", "código", "codigo", "cod",
+                   "mlb (item id)", "mlb(item id)", "mlb", "item id", "item_id"],
+            "nome": ["nome", "nome_produto", "produto", "descrição", "descricao", "name",
+                     "nome do produto"],
+            "custo": ["custo", "custo_produto", "cost", "costo", "valor_custo", "custo (r$)",
+                      "custo unitário", "custo unitario"],
             "peso_extra_kg": ["peso_extra_kg", "peso_extra", "peso adicional", "extra_kg"],
         }
 
@@ -369,74 +372,98 @@ def build_results_df(
     return pd.DataFrame(rows)
 
 
-def parse_shopee_excel(file) -> pd.DataFrame | None:
+def parse_vendas_excel(file) -> pd.DataFrame | None:
     """
-    Lê o arquivo de exportação em massa de produtos da Shopee.
+    Lê o relatório de Desempenho de Produtos (Parent SKU Detail) exportado
+    da Shopee Seller Center — o arquivo tem várias abas (ex: "Produtos com
+    Melhor Desempenho", "Impulsionar com ADS" etc.); usamos apenas a aba
+    "Produtos com Melhor Desempenho", que contém a lista completa de itens
+    do período. Diferente do arquivo de "Atualização em massa de produtos",
+    os dados começam logo na primeira linha (sem metadados antes do cabeçalho).
 
-    O arquivo exportado pela Shopee tem 3 linhas de metadados/instruções
-    antes dos dados reais, e usa nomes de coluna internos (et_title_*).
-
-    Retorna um DataFrame com: id, preco_shopee.
+    Retorna um DataFrame com: id, nome_produto, preco_efetivo — onde
+    ``preco_efetivo`` é a coluna "Vendas por Pedido (Pedido Pago) (BRL)", ou
+    seja, o valor médio pelo qual aquele produto foi efetivamente vendido no
+    período (já líquido de qualquer promoção/cupom aplicado especificamente
+    a ele — não é o preço de lista/cadastro).
     """
     try:
-        df = pd.read_excel(file, dtype=str, engine="calamine")
-        # As 3 primeiras linhas são metadados/instruções — pula elas
-        df = df.iloc[3:].reset_index(drop=True)
+        try:
+            df = pd.read_excel(
+                file,
+                sheet_name="Produtos com Melhor Desempenho",
+                dtype=str,
+                engine="calamine",
+            )
+        except ValueError:
+            # Nome da aba pode variar entre exportações — usa a primeira aba.
+            df = pd.read_excel(file, sheet_name=0, dtype=str, engine="calamine")
 
-        # Renomeia colunas internas para nomes padronizados
         df = df.rename(columns={
-            "et_title_product_id":    "id",
-            "et_title_product_name":  "nome_shopee",
-            "et_title_variation_price": "preco_shopee",
+            "ID do Item":                                "id",
+            "Produto":                                   "nome_produto",
+            "Vendas por Pedido (Pedido Pago) (BRL)":      "preco_efetivo",
         })
 
-        missing = [c for c in ("id", "preco_shopee") if c not in df.columns]
+        missing = [c for c in ("id", "preco_efetivo") if c not in df.columns]
         if missing:
             st.error(
-                "❌ Formato inesperado do arquivo Shopee. "
-                "Use o arquivo de 'Atualização em massa de produtos' exportado diretamente da Shopee."
+                "❌ Formato inesperado do relatório de vendas. "
+                "Use o relatório de Desempenho de Produtos (aba 'Produtos com "
+                "Melhor Desempenho') exportado da Shopee Seller Center."
             )
             return None
 
         df["id"] = df["id"].astype(str).str.strip()
-        df["preco_shopee"] = df["preco_shopee"].map(parse_br_currency)
+        df["preco_efetivo"] = df["preco_efetivo"].map(parse_br_currency)
 
-        # Remove linhas sem ID válido ou sem preço
+        if "nome_produto" in df.columns:
+            df["nome_produto"] = df["nome_produto"].astype(str).str.strip()
+        else:
+            df["nome_produto"] = df["id"]
+
+        # Remove linhas sem ID válido ou sem venda no período
         df = df[
             df["id"].notna()
             & ~df["id"].isin(["nan", "None", ""])
-            & (df["preco_shopee"] > 0)
+            & (df["preco_efetivo"] > 0)
         ]
 
-        # Se um produto tem múltiplas variantes, mantém a maior (mais conservador)
-        df = df.sort_values("preco_shopee", ascending=False)
+        # Um mesmo ID pode aparecer em mais de uma linha (ex: variação sem
+        # vendas no período gera linha duplicada com valor "-" → 0.0).
+        # Mantém a linha com o maior preço médio — critério conservador,
+        # igual ao usado anteriormente para variações da Shopee.
+        df = df.sort_values("preco_efetivo", ascending=False)
         df = df.drop_duplicates(subset="id", keep="first")
 
-        return df[["id", "preco_shopee"]].reset_index(drop=True)
+        return df[["id", "nome_produto", "preco_efetivo"]].reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"❌ Erro ao ler o arquivo Shopee: {e}")
+        st.error(f"❌ Erro ao ler o relatório de vendas: {e}")
         return None
 
 
 def build_diagnostico_df(
     df_raw: pd.DataFrame,
-    df_shopee: pd.DataFrame,
+    df_vendas: pd.DataFrame,
     aliquota_imposto: float,
-    tacos_pct: float = 0.0,
     afiliado_pct: float = 0.0,
     tacos_diag_pct: float = 0.0,
-    desconto_diag_pct: float = 0.0,
 ) -> pd.DataFrame:
     """
-    Cruza a planilha de custos com os preços atuais da Shopee e calcula
-    a margem real que cada produto está gerando hoje com o preço atual.
+    Cruza a planilha de custos com o preço médio de venda efetivo (relatório
+    de vendas) e calcula a margem real que cada produto está gerando hoje.
 
-    tacos_diag_pct   — TACOS médio atual da conta (% sobre receita efetiva).
-    desconto_diag_pct — desconto/cupom atual aplicado a todos os produtos (%).
+    O preço usado (``preco_efetivo``) já é o valor real de venda de cada
+    produto no período (pós-promoção/cupom), então não há mais nenhum
+    desconto genérico aplicado por cima dele.
+
+    tacos_diag_pct — TACOS médio atual da conta (% sobre receita efetiva).
+                      Usado sozinho no diagnóstico, independente do TACOS
+                      configurado na barra lateral (não são somados).
     """
     merged = df_raw[["id", "nome", "custo"]].merge(
-        df_shopee[["id", "preco_shopee"]],
+        df_vendas[["id", "preco_efetivo"]],
         on="id",
         how="inner",
     )
@@ -444,12 +471,9 @@ def build_diagnostico_df(
     rows = []
     for p in merged.to_dict("records"):
         custo = float(p.get("custo") or 0.0)
-        P_lista = float(p.get("preco_shopee") or 0.0)
-        if P_lista <= 0:
+        P = float(p.get("preco_efetivo") or 0.0)
+        if P <= 0:
             continue
-
-        # Preço efetivo após desconto atual
-        P = P_lista * (1.0 - desconto_diag_pct)
 
         tier = SHOPEE_FEE_TIERS[0]
         for t in SHOPEE_FEE_TIERS:
@@ -459,21 +483,20 @@ def build_diagnostico_df(
 
         commission   = P * tier.commission_pct + tier.fixed_fee
         imposto_val  = P * aliquota_imposto
-        tacos_val    = P * (tacos_pct + tacos_diag_pct)
+        tacos_val    = P * tacos_diag_pct
         afil_val     = P * afiliado_pct
         lucro = P - custo - commission - imposto_val - tacos_val - afil_val
         margem = lucro / P * 100 if P > 0 else 0.0
 
         rows.append({
-            "ID Produto":          str(p.get("id", "")),
-            "Nome":                str(p.get("nome", "")),
-            "Custo (R$)":          round(custo, 2),
-            "Preço Shopee (R$)":   round(P_lista, 2),
-            "Preço Efetivo (R$)":  round(P, 2),
-            "Comissão (R$)":       round(commission, 2),
-            "TACOS (R$)":          round(tacos_val, 2),
-            "Lucro Atual (R$)":    round(lucro, 2),
-            "Margem Atual (%)":    round(margem, 2),
+            "ID Produto":                str(p.get("id", "")),
+            "Nome":                      str(p.get("nome", "")),
+            "Custo (R$)":                round(custo, 2),
+            "Preço Médio de Venda (R$)": round(P, 2),
+            "Comissão (R$)":             round(commission, 2),
+            "TACOS (R$)":                round(tacos_val, 2),
+            "Lucro Atual (R$)":          round(lucro, 2),
+            "Margem Atual (%)":          round(margem, 2),
         })
 
     return pd.DataFrame(rows)
@@ -491,7 +514,6 @@ def generate_excel(
     afiliado_pct: float = 0.0,
     df_diagnostico: pd.DataFrame | None = None,
     tacos_diag_pct: float = 0.0,
-    desconto_diag_pct: float = 0.0,
 ) -> bytes:
     """Gera um Excel com formatação profissional e retorna bytes.
 
@@ -677,8 +699,8 @@ def generate_excel(
         la2 = Alignment(horizontal="left", vertical="center")
 
         diag_cols = [
-            "ID Produto", "Nome", "Custo (R$)", "Preço Shopee (R$)",
-            "Preço Efetivo (R$)", "Comissão (R$)", "TACOS (R$)",
+            "ID Produto", "Nome", "Custo (R$)", "Preço Médio de Venda (R$)",
+            "Comissão (R$)", "TACOS (R$)",
             "Lucro Atual (R$)", "Margem Atual (%)",
         ]
         n_cols2 = len(diag_cols)
@@ -692,10 +714,9 @@ def generate_excel(
         ws2["A1"].alignment = ca2
         ws2.row_dimensions[1].height = 30
 
-        # ── Linhas 2-4: Parâmetros do diagnóstico ──
+        # ── Linhas 2-3: Parâmetros do diagnóstico ──
         diag_params = [
             ("TACOS atual da conta",  f"{tacos_diag_pct * 100:.1f}%" if tacos_diag_pct > 0 else "—"),
-            ("Desconto atual",        f"{desconto_diag_pct * 100:.1f}%" if desconto_diag_pct > 0 else "—"),
             ("Imposto sobre receita", f"{aliquota * 100:.2f}%"),
         ]
         half = n_cols2 // 2
@@ -740,8 +761,7 @@ def generate_excel(
                 row2["ID Produto"],
                 row2["Nome"],
                 row2.get("Custo (R$)", 0.0),
-                row2.get("Preço Shopee (R$)", 0.0),
-                row2.get("Preço Efetivo (R$)", row2.get("Preço Shopee (R$)", 0.0)),
+                row2.get("Preço Médio de Venda (R$)", 0.0),
                 row2.get("Comissão (R$)", 0.0),
                 row2.get("TACOS (R$)", 0.0),
                 row2.get("Lucro Atual (R$)", 0.0),
@@ -749,7 +769,7 @@ def generate_excel(
             ]
             formats2 = [
                 None, None,
-                currency_num2, currency_num2, currency_num2,
+                currency_num2, currency_num2,
                 currency_num2, currency_num2,
                 currency_num2, pct_num2,
             ]
@@ -789,7 +809,7 @@ def generate_excel(
         media_cell.number_format = pct_num2
         ws2.row_dimensions[media_row].height = 22
 
-        col_widths2 = [16, 32, 13, 15, 15, 13, 13, 15, 14]
+        col_widths2 = [16, 32, 13, 18, 13, 13, 15, 14]
         for i2, w2 in enumerate(col_widths2, start=1):
             ws2.column_dimensions[get_column_letter(i2)].width = w2
         ws2.freeze_panes = f"A{first_data2}"
@@ -806,9 +826,9 @@ def generate_template_excel() -> bytes:
     ws = wb.active
     ws.title = "Produtos"
 
-    ws.cell(row=1, column=1, value="ID")
-    ws.cell(row=1, column=2, value="Nome")
-    ws.cell(row=1, column=3, value="Custo")
+    ws.cell(row=1, column=1, value="MLB (Item Id)")
+    ws.cell(row=1, column=2, value="Nome do Produto")
+    ws.cell(row=1, column=3, value="Custo Unitário")
 
     example_rows = [
         ("SKU-001", "Camiseta Básica", 49.90),
@@ -935,10 +955,10 @@ with col_hint:
         "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
         " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
         "<b style='color:#D4AF37'>Colunas obrigatórias:</b><br>"
-        "• <code style='color:#e8d5ff'>ID</code><br>"
-        "• <code style='color:#e8d5ff'>Custo</code> (valor numérico em R$)<br>"
+        "• <code style='color:#e8d5ff'>MLB (Item Id)</code><br>"
+        "• <code style='color:#e8d5ff'>Custo Unitário</code> (valor numérico em R$)<br>"
         "<b style='color:#D4AF37'>Colunas opcionais:</b><br>"
-        "• <code style='color:#e8d5ff'>Nome</code>"
+        "• <code style='color:#e8d5ff'>Nome do Produto</code>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1228,7 +1248,7 @@ if uploaded is not None:
         col_up_s, col_hint_s = st.columns([2, 3])
         with col_up_s:
             uploaded_shopee = st.file_uploader(
-                "Planilha Shopee",
+                "Relatório de Vendas Shopee",
                 type=["xlsx", "xls"],
                 key="shopee_uploader",
                 label_visibility="collapsed",
@@ -1238,10 +1258,14 @@ if uploaded is not None:
                 "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
                 " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
                 "<b style='color:#D4AF37'>Como usar:</b><br>"
-                "Exporte a planilha de <b>Atualização em massa de produtos</b> "
-                "diretamente da Shopee e faça o upload aqui.<br>"
+                "Exporte o relatório de <b>Desempenho de Produtos</b> (aba "
+                "<b>Produtos com Melhor Desempenho</b>) da Shopee Seller Center "
+                "e faça o upload aqui.<br>"
                 "O <code style='color:#e8d5ff'>ID</code> da sua planilha de custos "
-                "deve ser o <b style='color:#e8d5ff'>ID do Produto</b> na Shopee."
+                "deve ser o <b style='color:#e8d5ff'>ID do Item</b> na Shopee.<br>"
+                "A margem é calculada com base no <b style='color:#e8d5ff'>preço médio "
+                "de venda real</b> de cada produto no período (coluna "
+                "<i>Vendas por Pedido (Pedido Pago)</i>), já líquido de promoções e cupons."
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -1252,7 +1276,7 @@ if uploaded is not None:
                 or st.session_state.shopee_file != uploaded_shopee.name
             ):
                 st.session_state.shopee_file = uploaded_shopee.name
-                st.session_state.df_shopee = parse_shopee_excel(uploaded_shopee)
+                st.session_state.df_shopee = parse_vendas_excel(uploaded_shopee)
 
             df_shopee = st.session_state.get("df_shopee")
 
@@ -1266,35 +1290,25 @@ if uploaded is not None:
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                col_td, col_dd, col_esp = st.columns([1, 1, 4])
+                col_td, _ = st.columns([1, 2])
                 with col_td:
                     tacos_diag_txt = st.text_input(
                         "TACOS médio atual (%)",
-                        value="0",
+                        placeholder="Ex: 5",
                         key="tacos_diag_input",
-                        help="% do faturamento gasto com anúncios atualmente "
-                             "(ex: 5 = 5%). Soma ao TACOS da barra lateral.",
-                    )
-                with col_dd:
-                    desconto_diag_txt = st.text_input(
-                        "Desconto atual (%)",
-                        value="0",
-                        key="desconto_diag_input",
-                        help="Desconto/cupom aplicado atualmente sobre o preço listado "
-                             "(ex: 10 = 10% de desconto em todos os produtos).",
+                        help="% do faturamento gasto com anúncios atualmente na sua "
+                             "conta Shopee (ex: 5 = 5%). Usado apenas no diagnóstico, "
+                             "independente do TACOS configurado na barra lateral.",
                     )
 
                 tacos_diag = min(max(parse_br_currency(tacos_diag_txt) / 100.0, 0.0), 1.0)
-                desconto_diag = min(max(parse_br_currency(desconto_diag_txt) / 100.0, 0.0), 1.0)
 
                 df_diag = build_diagnostico_df(
                     df_raw=df_raw,
-                    df_shopee=df_shopee,
+                    df_vendas=df_shopee,
                     aliquota_imposto=aliquota + spike_day_rate,
-                    tacos_pct=tacos,
                     afiliado_pct=afiliado,
                     tacos_diag_pct=tacos_diag,
-                    desconto_diag_pct=desconto_diag,
                 )
 
                 if len(df_diag) == 0:
@@ -1412,19 +1426,16 @@ if uploaded is not None:
                         return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
 
                     fmt_diag = {
-                        "Custo (R$)":          "R$ {:,.2f}",
-                        "Preço Shopee (R$)":   "R$ {:,.2f}",
-                        "Preço Efetivo (R$)":  "R$ {:,.2f}",
-                        "Comissão (R$)":       "R$ {:,.2f}",
-                        "TACOS (R$)":          "R$ {:,.2f}",
-                        "Lucro Atual (R$)":    "R$ {:,.2f}",
-                        "Margem Atual (%)":    "{:.2f}%",
+                        "Custo (R$)":                "R$ {:,.2f}",
+                        "Preço Médio de Venda (R$)": "R$ {:,.2f}",
+                        "Comissão (R$)":             "R$ {:,.2f}",
+                        "TACOS (R$)":                "R$ {:,.2f}",
+                        "Lucro Atual (R$)":          "R$ {:,.2f}",
+                        "Margem Atual (%)":          "{:.2f}%",
                     }
-                    # Oculta "Preço Efetivo" se não há desconto e "TACOS" se não há tacos
+                    # Oculta "TACOS" se não há tacos configurado
                     cols_drop_diag = []
-                    if desconto_diag == 0.0:
-                        cols_drop_diag.append("Preço Efetivo (R$)")
-                    if tacos_diag == 0.0 and tacos == 0.0:
+                    if tacos_diag == 0.0:
                         cols_drop_diag.append("TACOS (R$)")
                     diag_display = df_diag_view.drop(
                         columns=[c for c in cols_drop_diag if c in df_diag_view.columns],
@@ -1454,7 +1465,6 @@ if uploaded is not None:
                         afiliado_pct=afiliado,
                         df_diagnostico=df_diag,
                         tacos_diag_pct=tacos_diag,
-                        desconto_diag_pct=desconto_diag,
                     )
                     st.download_button(
                         label="⬇️ Baixar Excel com Diagnóstico",
