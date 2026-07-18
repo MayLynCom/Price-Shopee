@@ -105,14 +105,14 @@ def parse_br_currency(value) -> float:
         return 0.0
 
 
-def render_cost_breakdown(row: pd.Series) -> None:
+def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
     """
     Renderiza um gráfico de pizza (donut) mostrando como o preço do produto
     se decompõe em fatias limpas:
       • Custo + Taxa Fixa Shopee  (a taxa fixa é agrupada com o custo
                                     porque é um valor fixo, não percentual)
       • Comissão Shopee %         (apenas a parte percentual)
-      • Imposto + Spike Day
+      • Imposto (+ Spike Day, se ativo)
       • Lucro Líquido (% do preço)
       • TACOS                     (apenas se > 0)
       • Afiliado                  (apenas se > 0)
@@ -150,20 +150,23 @@ def render_cost_breakdown(row: pd.Series) -> None:
 
     nome = str(row["Nome"])
 
+    label_imposto = "Imposto + Spike Day" if spike_day else "Imposto"
+    label_custo_taxa = f"Custo + Taxa Fixa Shopee ({fmt_brl(taxa_fixa)})"
+
     componentes = [
         ("Comissão Shopee (%)",       comissao_pct,  pct_comissao, "#E67E22"),
-        ("Imposto + Spike Day",       imposto_spike, pct_imposto,  "#C0392B"),
-        ("Custo + Taxa Fixa Shopee",  custo_e_taxa,  pct_custo,    "#7B2FBE"),
+        (label_imposto,                imposto_spike, pct_imposto,  "#C0392B"),
+        (label_custo_taxa,             custo_e_taxa,  pct_custo,    "#7B2FBE"),
         ("Lucro Líquido",             lucro,         pct_lucro,    "#1DB954"),
     ]
     # Só inclui TACOS / Afiliado quando > 0 (abaixo de Lucro)
     if tacos_v > 0:
         componentes.append(
-            ("TACOS (Anúncios)",      tacos_v,       pct_tacos,    "#F39C12")
+            ("TACOS (Anúncios)",      tacos_v,       pct_tacos,    "#17A2B8")
         )
     if afiliado_v > 0:
         componentes.append(
-            ("Comissão de Afiliado",  afiliado_v,    pct_afiliado, "#8E44AD")
+            ("Comissão de Afiliado",  afiliado_v,    pct_afiliado, "#E91E63")
         )
 
     # Monta as fatias da pizza usando conic-gradient (CSS puro)
@@ -1057,9 +1060,9 @@ if uploaded is not None:
         if spike_day:
             badges_html += " &nbsp; " + badge_html("Spike Day +3,5%", "#E67E22")
         if tacos_pct_input > 0:
-            badges_html += " &nbsp; " + badge_html(f"TACOS {tacos_pct_input}%", "#C0392B")
+            badges_html += " &nbsp; " + badge_html(f"TACOS {tacos_pct_input}%", "#17A2B8")
         if afiliado_pct_input > 0:
-            badges_html += " &nbsp; " + badge_html(f"Afiliado {afiliado_pct_input}%", "#8E44AD")
+            badges_html += " &nbsp; " + badge_html(f"Afiliado {afiliado_pct_input}%", "#E91E63")
         if margem_individual:
             badges_html += " &nbsp; " + badge_html("Margem por linha", "#D4AF37")
         st.markdown(badges_html, unsafe_allow_html=True)
@@ -1202,7 +1205,7 @@ if uploaded is not None:
 
         # ── Breakdown de custos do primeiro produto ────────────────────────
         if len(df_table) > 0:
-            render_cost_breakdown(df_table.iloc[0])
+            render_cost_breakdown(df_table.iloc[0], spike_day=spike_day)
 
         # ── Exportação ─────────────────────────────────────────────────────
         st.markdown(
