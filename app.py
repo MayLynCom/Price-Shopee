@@ -1517,7 +1517,7 @@ else:
     )
 
     df_fees = pd.DataFrame([
-        {"Faixa de Preço": "Até R$ 79,99",        "Comissão": "20% + R$ 4,00",  "Subsídio Pix": "—"},
+        {"Faixa de Preço": "Até R$ 79,99",        "Comissão": "20% + R$ 4,50",  "Subsídio Pix": "—"},
         {"Faixa de Preço": "R$ 80 a R$ 99,99",    "Comissão": "14% + R$ 16,00", "Subsídio Pix": "5%"},
         {"Faixa de Preço": "R$ 100 a R$ 199,99",  "Comissão": "14% + R$ 20,00", "Subsídio Pix": "5%"},
         {"Faixa de Preço": "R$ 200 a R$ 499,99",  "Comissão": "14% + R$ 26,00", "Subsídio Pix": "5%"},

@@ -19,7 +19,7 @@ class ShopeeFeeTier:
 
 
 SHOPEE_FEE_TIERS: list[ShopeeFeeTier] = [
-    ShopeeFeeTier(0.0,    79.99,  0.20,  4.00,  0.0),
+    ShopeeFeeTier(0.0,    79.99,  0.20,  4.50,  0.0),
     ShopeeFeeTier(80.0,   99.99,  0.14, 16.00,  0.05),
     ShopeeFeeTier(100.0, 199.99,  0.14, 20.00,  0.05),
     ShopeeFeeTier(200.0, 499.99,  0.14, 26.00,  0.05),
