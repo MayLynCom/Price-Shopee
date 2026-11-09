@@ -910,11 +910,11 @@ with st.sidebar:
     st.divider()
     st.markdown("**Taxa Spike Day**")
     spike_day = st.toggle(
-        "Spike Day (+3,5%)",
+        "Spike Day (+5%)",
         value=False,
-        help="Taxa adicional cobrada pela Shopee em produtos participantes do Spike Day. Adiciona 3,5% sobre a receita bruta.",
+        help="Taxa adicional cobrada pela Shopee em produtos participantes do Spike Day. Adiciona 5% sobre a receita bruta.",
     )
-    spike_day_rate = 0.035 if spike_day else 0.0
+    spike_day_rate = 0.05 if spike_day else 0.0
 
     st.divider()
     st.markdown(
@@ -1058,7 +1058,7 @@ if uploaded is not None:
             + badge_html(f"Imposto {aliquota_pct:.1f}%", "#1a7a4a")
         )
         if spike_day:
-            badges_html += " &nbsp; " + badge_html("Spike Day +3,5%", "#E67E22")
+            badges_html += " &nbsp; " + badge_html("Spike Day +5%", "#E67E22")
         if tacos_pct_input > 0:
             badges_html += " &nbsp; " + badge_html(f"TACOS {tacos_pct_input}%", "#17A2B8")
         if afiliado_pct_input > 0:
