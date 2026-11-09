@@ -1,5 +1,5 @@
 """
-Shopee Price Calculator — App principal (Streamlit).
+Marketplace Price Calculator (Shopee / TikTok Shop) — App principal (Streamlit).
 
 Execução:
     streamlit run app.py
@@ -17,7 +17,7 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 from pricing import calcular_preco
-from fees import SHOPEE_FEE_TIERS
+from fees import SHOPEE_FEE_TIERS, MARKETPLACES, TIKTOK_FRETE_GRATIS_PCT, TIKTOK_FRETE_GRATIS_TETO
 from styles import (
     CUSTOM_CSS, TITLE_HTML, SIDEBAR_HEADER_HTML,
     section_header, badge_html,
@@ -25,7 +25,7 @@ from styles import (
 
 # ── Configuração da página ────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shopee Price Calculator",
+    page_title="Price Calculator",
     page_icon="🛍️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -119,13 +119,14 @@ def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
     """
     preco       = float(row["Preço Alvo (R$)"])
     custo       = float(row["Custo (R$)"])
-    comissao    = float(row["Comissão Shopee (R$)"])
-    taxa_fixa   = float(row["Taxa Fixa Shopee (R$)"])
+    comissao    = float(row[COL_COM])
+    taxa_fixa   = float(row[COL_TAXA])
     lucro       = float(row["Lucro (R$)"])
     break_even  = float(row["Break-Even (R$)"])
     margem_real = float(row["Margem Real"])
     tacos_v     = float(row.get("TACOS (R$)", 0.0) or 0.0)
     afiliado_v  = float(row.get("Afiliado (R$)", 0.0) or 0.0)
+    frete_v     = float(row.get("Frete Grátis (R$)", 0.0) or 0.0)
 
     if preco <= 0:
         return
@@ -138,7 +139,8 @@ def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
     # Garante que os componentes somem exatamente 100%.
     imposto_spike = max(
         0.0,
-        preco - comissao_pct - custo_e_taxa - lucro - tacos_v - afiliado_v,
+        preco - comissao_pct - custo_e_taxa - lucro - tacos_v - afiliado_v
+        - frete_v,
     )
 
     pct_comissao = comissao_pct  / preco * 100
@@ -147,14 +149,15 @@ def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
     pct_lucro    = lucro         / preco * 100
     pct_tacos    = tacos_v       / preco * 100
     pct_afiliado = afiliado_v    / preco * 100
+    pct_frete    = frete_v       / preco * 100
 
     nome = str(row["Nome"])
 
     label_imposto = "Imposto + Spike Day" if spike_day else "Imposto"
-    label_custo_taxa = f"Custo + Taxa Fixa Shopee ({fmt_brl(taxa_fixa)})"
+    label_custo_taxa = f"Custo + Taxa Fixa {MP.nome} ({fmt_brl(taxa_fixa)})"
 
     componentes = [
-        ("Comissão Shopee (%)",       comissao_pct,  pct_comissao, "#E67E22"),
+        (f"Comissão {MP.nome} (%)",    comissao_pct,  pct_comissao, "#E67E22"),
         (label_imposto,                imposto_spike, pct_imposto,  "#C0392B"),
         (label_custo_taxa,             custo_e_taxa,  pct_custo,    "#7B2FBE"),
         ("Lucro Líquido",             lucro,         pct_lucro,    "#1DB954"),
@@ -167,6 +170,10 @@ def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
     if afiliado_v > 0:
         componentes.append(
             ("Comissão de Afiliado",  afiliado_v,    pct_afiliado, "#E91E63")
+        )
+    if frete_v > 0:
+        componentes.append(
+            ("Frete Grátis",          frete_v,       pct_frete,    "#9B59B6")
         )
 
     # Monta as fatias da pizza usando conic-gradient (CSS puro)
@@ -247,7 +254,7 @@ def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
         "<b style=\"color:#E67E22;\">⚖️ Break-Even (preço de equilíbrio):</b> "
         f"<b style=\"color:#D4AF37;\">{fmt_brl(break_even)}</b>. "
         "Esse é o <b>preço mínimo</b> que você teria que cobrar para cobrir "
-        "exatamente todas as despesas (custo do produto + comissão Shopee + "
+        f"exatamente todas as despesas (custo do produto + comissão {MP.nome} + "
         "imposto), <b>sem ganhar e nem perder nada</b>."
         "<div style=\"margin-top:6px; font-size:0.78rem; color:#a98ec9;\">"
         "Vender <b style=\"color:#E74C3C;\">abaixo</b> disso = prejuízo. "
@@ -330,6 +337,7 @@ def build_results_df(
     tacos_pct: float = 0.0,
     afiliado_pct: float = 0.0,
     margens_override: dict[str, float] | None = None,
+    frete_gratis: bool = False,
 ) -> pd.DataFrame:
     """
     Executa o motor de cálculo e retorna um DataFrame formatado.
@@ -354,8 +362,11 @@ def build_results_df(
             aliquota_imposto=aliquota_imposto,
             tacos_pct=tacos_pct,
             afiliado_pct=afiliado_pct,
+            tiers=MP.tiers,
+            taxa_extra_pct=TIKTOK_FRETE_GRATIS_PCT if frete_gratis else 0.0,
+            taxa_extra_teto=TIKTOK_FRETE_GRATIS_TETO if frete_gratis else None,
         )
-        rows.append({
+        row = {
             "ID Produto": r.produto_id,
             "Nome": r.nome_produto,
             "Custo (R$)": r.custo,
@@ -363,14 +374,17 @@ def build_results_df(
             "Break-Even (R$)": r.preco_break_even,
             "Fake Price (R$)": r.fake_price,
             "Lucro (R$)": r.lucro,
-            "Comissão Shopee (R$)": r.comissao_shopee,
-            "Taxa Fixa Shopee (R$)": r.taxa_fixa_shopee,
+            COL_COM: r.comissao_shopee,
+            COL_TAXA: r.taxa_fixa_shopee,
             "Imposto (R$)": r.imposto_valor,
             "TACOS (R$)": r.tacos_valor,
             "Afiliado (R$)": r.afiliado_valor,
             "Margem Real": r.margem_real,
             "Viável": r.viavel,
-        })
+        }
+        if frete_gratis:
+            row["Frete Grátis (R$)"] = r.frete_valor
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -517,6 +531,7 @@ def generate_excel(
     afiliado_pct: float = 0.0,
     df_diagnostico: pd.DataFrame | None = None,
     tacos_diag_pct: float = 0.0,
+    frete_gratis: bool = False,
 ) -> bytes:
     """Gera um Excel com formatação profissional e retorna bytes.
 
@@ -526,7 +541,7 @@ def generate_excel(
     """
     wb = Workbook()
     ws = wb.active
-    ws.title = "Precificação Shopee"
+    ws.title = f"Precificação {MP.nome}"[:31]
 
     # Paleta
     ROXO_ESC = "1a0533"
@@ -555,7 +570,7 @@ def generate_excel(
 
     # ── Linha 1: Título ──
     ws.merge_cells("A1:J1")
-    ws["A1"] = "SHOPEE PRICE CALCULATOR"
+    ws["A1"] = f"{MP.nome.upper()} PRICE CALCULATOR"
     ws["A1"].font = font_title
     ws["A1"].fill = fill_title
     ws["A1"].alignment = center_align
@@ -574,7 +589,11 @@ def generate_excel(
         ("Margem por linha", "Sim" if margem_individual else "Não"),
         ("Desconto Promocional (Fake Price)", f"{desconto_promo*100:.1f}%"),
         ("Imposto sobre Receita", f"{aliquota*100:.2f}%"),
-        ("Spike Day", "Ativo" if spike_day else "—"),
+        *([("Spike Day (+5%)", "Ativo" if spike_day else "—")]
+          if MP.tem_spike_day else []),
+        *([("Programa de Frete Grátis (+6%, máx. R$ 50)",
+            "Ativo" if frete_gratis else "—")]
+          if MP.tem_frete_gratis else []),
         ("TACOS (anúncios)", tacos_param),
         ("Comissão de Afiliado", afiliado_param),
     ]
@@ -598,8 +617,10 @@ def generate_excel(
     data_cols = [
         "ID Produto", "Nome", "Custo (R$)", "Preço Alvo (R$)",
         "Fake Price (R$)", "Lucro (R$)", "Margem %",
-        "Comissão Shopee (R$)", "TACOS (R$)", "Afiliado (R$)",
+        COL_COM, "TACOS (R$)", "Afiliado (R$)",
     ]
+    if frete_gratis:
+        data_cols.append("Frete Grátis (R$)")
     for col_idx, col_name in enumerate(data_cols, start=1):
         cell = ws.cell(row=header_row, column=col_idx, value=col_name)
         cell.font = font_header
@@ -628,7 +649,7 @@ def generate_excel(
             row["Fake Price (R$)"],
             row["Lucro (R$)"],
             margem_real_pct,
-            row["Comissão Shopee (R$)"],
+            row[COL_COM],
             tacos_val,
             afiliado_val,
         ]
@@ -638,6 +659,9 @@ def generate_excel(
             currency_num, pct_num, currency_num,
             currency_num, currency_num,
         ]
+        if frete_gratis:
+            values.append(float(row.get("Frete Grátis (R$)", 0.0) or 0.0))
+            formats.append(currency_num)
 
         for col_idx, (val, fmt) in enumerate(zip(values, formats), start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
@@ -655,7 +679,7 @@ def generate_excel(
         ws.row_dimensions[row_idx].height = 18
 
     # ── Largura das colunas ──
-    col_widths = [14, 24, 14, 16, 16, 14, 12, 20, 14, 14]
+    col_widths = [14, 24, 14, 16, 16, 14, 12, 20, 14, 14, 16]
     for i, w in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -849,8 +873,39 @@ def generate_template_excel() -> bytes:
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Seletor de marketplace (abas no topo) ─────────────────────────────────────
+# O valor escolhido fica em st.session_state["marketplace"]; lemos antes de
+# desenhar o cabeçalho para que o título já mostre o marketplace certo.
+_MP_LABELS = {k: f"{mp.emoji} {mp.nome}" for k, mp in MARKETPLACES.items()}
+# Clicar de novo na aba já selecionada desmarca o botão (valor None);
+# nesse caso mantém o último marketplace escolhido.
+if st.session_state.get("marketplace") not in MARKETPLACES:
+    st.session_state["marketplace"] = st.session_state.get("_mp_ultimo", "shopee")
+st.session_state["_mp_ultimo"] = st.session_state["marketplace"]
+MP = MARKETPLACES[st.session_state["marketplace"]]
+COL_COM = f"Comissão {MP.nome} (R$)"
+COL_TAXA = f"Taxa Fixa {MP.nome} (R$)"
+
+st.markdown(
+    TITLE_HTML.replace("🛍️", MP.emoji).replace("Shopee", MP.nome),
+    unsafe_allow_html=True,
+)
+
+st.segmented_control(
+    "Marketplace",
+    options=list(MARKETPLACES.keys()),
+    format_func=lambda k: _MP_LABELS[k],
+    key="marketplace",
+    label_visibility="collapsed",
+)
+
 with st.sidebar:
     st.markdown(SIDEBAR_HEADER_HTML, unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='text-align:center; color:#D4AF37; font-weight:700; "
+        f"margin-bottom:8px;'>{MP.emoji} {MP.nome}</div>",
+        unsafe_allow_html=True,
+    )
 
     st.markdown("**Margem de Lucro Geral**")
     margem_pct = st.slider(
@@ -895,7 +950,7 @@ with st.sidebar:
     tacos_pct_input = st.slider(
         "TACOS (%)", min_value=0, max_value=50, value=0, step=1,
         label_visibility="collapsed",
-        help="Total Advertising Cost of Sales — percentual do preço gasto com anúncios (Shopee Ads). "
+        help=f"Total Advertising Cost of Sales — percentual do preço gasto com anúncios ({MP.nome_ads}). "
              "Deixe em 0 se não anuncia.",
     )
 
@@ -907,19 +962,31 @@ with st.sidebar:
              "Deixe em 0 se não usa programa de afiliados.",
     )
 
-    st.divider()
-    st.markdown("**Taxa Spike Day**")
-    spike_day = st.toggle(
-        "Spike Day (+5%)",
-        value=False,
-        help="Taxa adicional cobrada pela Shopee em produtos participantes do Spike Day. Adiciona 5% sobre a receita bruta.",
-    )
+    spike_day = False
+    frete_gratis = False
+    if MP.tem_spike_day:
+        st.divider()
+        st.markdown("**Taxa Spike Day**")
+        spike_day = st.toggle(
+            "Spike Day (+5%)",
+            value=False,
+            help="Taxa adicional cobrada pela Shopee em produtos participantes do Spike Day. Adiciona 5% sobre a receita bruta.",
+        )
+    if MP.tem_frete_gratis:
+        st.divider()
+        st.markdown("**Programa de Frete Grátis**")
+        frete_gratis = st.toggle(
+            "Frete Grátis (+6%, máx. R$ 50)",
+            value=False,
+            help="Taxa do Programa de Frete Grátis do TikTok Shop: 6% sobre o "
+                 "preço do produto, limitada a R$ 50 por item.",
+        )
     spike_day_rate = 0.05 if spike_day else 0.0
 
     st.divider()
     st.markdown(
         "<div style='text-align:center; color:#7B2FBE; font-size:0.75rem;'>"
-        "Taxas Shopee conforme tabela oficial<br>Versão 1.0</div>",
+        f"Taxas {MP.nome} conforme tabela oficial<br>Versão 1.1</div>",
         unsafe_allow_html=True,
     )
 
@@ -930,8 +997,6 @@ aliquota       = aliquota_pct / 100
 tacos          = tacos_pct_input / 100
 afiliado       = afiliado_pct_input / 100
 
-# ── Cabeçalho principal ───────────────────────────────────────────────────────
-st.markdown(TITLE_HTML, unsafe_allow_html=True)
 
 # ── Upload ────────────────────────────────────────────────────────────────────
 st.markdown(
@@ -949,7 +1014,7 @@ with col_upload:
     st.download_button(
         label="⬇️ Baixar Planilha Modelo",
         data=generate_template_excel(),
-        file_name="modelo_shopee.xlsx",
+        file_name=f"modelo_{MP.chave}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         help="Baixe o modelo, preencha com seus produtos e faça o upload acima.",
     )
@@ -1036,6 +1101,7 @@ if uploaded is not None:
             tacos_pct=tacos,
             afiliado_pct=afiliado,
             margens_override=margens_override,
+            frete_gratis=frete_gratis,
         )
 
         # ── Tabela de resultados ────────────────────────────────────────────
@@ -1057,6 +1123,8 @@ if uploaded is not None:
             + " &nbsp; "
             + badge_html(f"Imposto {aliquota_pct:.1f}%", "#1a7a4a")
         )
+        if frete_gratis:
+            badges_html += " &nbsp; " + badge_html("Frete Grátis +6%", "#9B59B6")
         if spike_day:
             badges_html += " &nbsp; " + badge_html("Spike Day +5%", "#E67E22")
         if tacos_pct_input > 0:
@@ -1091,7 +1159,7 @@ if uploaded is not None:
 
         # Formata o DataFrame para exibição
         cols_to_drop = [
-            "Viável", "Break-Even (R$)", "Taxa Fixa Shopee (R$)",
+            "Viável", "Break-Even (R$)", COL_TAXA,
             "Imposto (R$)", "Margem Real",
         ]
         # Só exibe TACOS / Afiliado na tabela quando o usuário tiver definido > 0
@@ -1179,11 +1247,12 @@ if uploaded is not None:
                 return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
 
             fmt_map = {
+                "Frete Grátis (R$)":   "R$ {:,.2f}",
                 "Custo (R$)":          "R$ {:,.2f}",
                 "Preço Alvo (R$)":     "R$ {:,.2f}",
                 "Fake Price (R$)":     "R$ {:,.2f}",
                 "Lucro (R$)":          "R$ {:,.2f}",
-                "Comissão Shopee (R$)":"R$ {:,.2f}",
+                COL_COM:"R$ {:,.2f}",
             }
             if tacos_pct_input > 0:
                 fmt_map["TACOS (R$)"] = "R$ {:,.2f}"
@@ -1222,6 +1291,7 @@ if uploaded is not None:
             margem_individual=margem_individual,
             tacos_pct=tacos,
             afiliado_pct=afiliado,
+            frete_gratis=frete_gratis,
         )
 
         col_dl, col_info = st.columns([1, 3])
@@ -1229,7 +1299,7 @@ if uploaded is not None:
             st.download_button(
                 label="⬇️ Baixar Excel",
                 data=excel_bytes,
-                file_name="shopee_precificacao.xlsx",
+                file_name=f"{MP.chave}_precificacao.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         with col_info:
@@ -1241,241 +1311,242 @@ if uploaded is not None:
                 unsafe_allow_html=True,
             )
 
-        # ── Diagnóstico de Preços Atuais ────────────────────────────────────
-        st.divider()
-        st.markdown(
-            section_header("Diagnóstico de Preços Atuais (Shopee)", "🔍"),
-            unsafe_allow_html=True,
-        )
-
-        col_up_s, col_hint_s = st.columns([2, 3])
-        with col_up_s:
-            uploaded_shopee = st.file_uploader(
-                "Relatório de Vendas Shopee",
-                type=["xlsx", "xls"],
-                key="shopee_uploader",
-                label_visibility="collapsed",
-            )
-        with col_hint_s:
+        if MP.tem_diagnostico:
+            # ── Diagnóstico de Preços Atuais ────────────────────────────────────
+            st.divider()
             st.markdown(
-                "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
-                " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
-                "<b style='color:#D4AF37'>Como usar:</b><br>"
-                "Exporte o relatório de <b>Desempenho de Produtos</b> (aba "
-                "<b>Produtos com Melhor Desempenho</b>) da Shopee Seller Center "
-                "e faça o upload aqui.<br>"
-                "O <code style='color:#e8d5ff'>ID</code> da sua planilha de custos "
-                "deve ser o <b style='color:#e8d5ff'>ID do Item</b> na Shopee.<br>"
-                "A margem é calculada com base no <b style='color:#e8d5ff'>preço médio "
-                "de venda real</b> de cada produto no período (coluna "
-                "<i>Vendas por Pedido (Pedido Pago)</i>), já líquido de promoções e cupons."
-                "</div>",
+                section_header("Diagnóstico de Preços Atuais (Shopee)", "🔍"),
                 unsafe_allow_html=True,
             )
 
-        if uploaded_shopee is not None:
-            if (
-                "shopee_file" not in st.session_state
-                or st.session_state.shopee_file != uploaded_shopee.name
-            ):
-                st.session_state.shopee_file = uploaded_shopee.name
-                st.session_state.df_shopee = parse_vendas_excel(uploaded_shopee)
-
-            df_shopee = st.session_state.get("df_shopee")
-
-            if df_shopee is not None and len(df_shopee) > 0:
-
-                # ── Configurações do diagnóstico ───────────────────────────
+            col_up_s, col_hint_s = st.columns([2, 3])
+            with col_up_s:
+                uploaded_shopee = st.file_uploader(
+                    "Relatório de Vendas Shopee",
+                    type=["xlsx", "xls"],
+                    key="shopee_uploader",
+                    label_visibility="collapsed",
+                )
+            with col_hint_s:
                 st.markdown(
-                    "<div style='background:#1a0533; border:1px solid #7B2FBE;"
-                    " border-radius:8px; padding:12px 18px; margin-bottom:12px;'>"
-                    "<b style='color:#D4AF37; font-size:0.9rem;'>⚙️ Parâmetros do cenário atual</b>"
+                    "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
+                    " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
+                    "<b style='color:#D4AF37'>Como usar:</b><br>"
+                    "Exporte o relatório de <b>Desempenho de Produtos</b> (aba "
+                    "<b>Produtos com Melhor Desempenho</b>) da Shopee Seller Center "
+                    "e faça o upload aqui.<br>"
+                    "O <code style='color:#e8d5ff'>ID</code> da sua planilha de custos "
+                    "deve ser o <b style='color:#e8d5ff'>ID do Item</b> na Shopee.<br>"
+                    "A margem é calculada com base no <b style='color:#e8d5ff'>preço médio "
+                    "de venda real</b> de cada produto no período (coluna "
+                    "<i>Vendas por Pedido (Pedido Pago)</i>), já líquido de promoções e cupons."
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                col_td, _ = st.columns([1, 2])
-                with col_td:
-                    tacos_diag_txt = st.text_input(
-                        "TACOS médio atual (%)",
-                        placeholder="Ex: 5",
-                        key="tacos_diag_input",
-                        help="% do faturamento gasto com anúncios atualmente na sua "
-                             "conta Shopee (ex: 5 = 5%). Usado apenas no diagnóstico, "
-                             "independente do TACOS configurado na barra lateral.",
+
+            if uploaded_shopee is not None:
+                if (
+                    "shopee_file" not in st.session_state
+                    or st.session_state.shopee_file != uploaded_shopee.name
+                ):
+                    st.session_state.shopee_file = uploaded_shopee.name
+                    st.session_state.df_shopee = parse_vendas_excel(uploaded_shopee)
+
+                df_shopee = st.session_state.get("df_shopee")
+
+                if df_shopee is not None and len(df_shopee) > 0:
+
+                    # ── Configurações do diagnóstico ───────────────────────────
+                    st.markdown(
+                        "<div style='background:#1a0533; border:1px solid #7B2FBE;"
+                        " border-radius:8px; padding:12px 18px; margin-bottom:12px;'>"
+                        "<b style='color:#D4AF37; font-size:0.9rem;'>⚙️ Parâmetros do cenário atual</b>"
+                        "</div>",
+                        unsafe_allow_html=True,
                     )
-
-                tacos_diag = min(max(parse_br_currency(tacos_diag_txt) / 100.0, 0.0), 1.0)
-
-                df_diag = build_diagnostico_df(
-                    df_raw=df_raw,
-                    df_vendas=df_shopee,
-                    aliquota_imposto=aliquota + spike_day_rate,
-                    afiliado_pct=afiliado,
-                    tacos_diag_pct=tacos_diag,
-                )
-
-                if len(df_diag) == 0:
-                    st.warning(
-                        "⚠️ Nenhum produto correspondente encontrado. "
-                        "Verifique se o ID da planilha de custos coincide "
-                        "com o ID do Produto na Shopee."
-                    )
-                else:
-                    n_matched = len(df_diag)
-                    n_total   = len(df_raw)
-                    st.caption(
-                        f"{n_matched} de {n_total} produto(s) com preço Shopee encontrado(s)."
-                    )
-
-                    # ── Filtros ──────────────────────────────────────────────
-                    col_busca, col_op, col_pct = st.columns([3, 1, 1])
-
-                    with col_busca:
-                        busca_diag = st.text_input(
-                            "Pesquisar por ID ou Nome",
-                            placeholder="Digite o ID ou nome do produto...",
-                            key="busca_diag",
-                        ).strip()
-
-                    with col_op:
-                        operador = st.selectbox(
-                            "Filtro de margem",
-                            options=["Todos", "< menor que", "> maior que"],
-                            key="op_margem_diag",
-                            label_visibility="visible",
+                    col_td, _ = st.columns([1, 2])
+                    with col_td:
+                        tacos_diag_txt = st.text_input(
+                            "TACOS médio atual (%)",
+                            placeholder="Ex: 5",
+                            key="tacos_diag_input",
+                            help="% do faturamento gasto com anúncios atualmente na sua "
+                                 "conta Shopee (ex: 5 = 5%). Usado apenas no diagnóstico, "
+                                 "independente do TACOS configurado na barra lateral.",
                         )
 
-                    with col_pct:
-                        filtro_pct_txt = st.text_input(
-                            "Margem (%)",
-                            placeholder="Ex: 10",
-                            key="filtro_pct_diag",
-                            disabled=(operador == "Todos"),
-                            label_visibility="visible",
-                        )
+                    tacos_diag = min(max(parse_br_currency(tacos_diag_txt) / 100.0, 0.0), 1.0)
 
-                    # Aplica busca por texto
-                    df_diag_view = df_diag.copy()
-                    if busca_diag:
-                        mask_busca = (
-                            df_diag_view["ID Produto"].astype(str).str.contains(
-                                busca_diag, case=False, na=False, regex=False
-                            )
-                            | df_diag_view["Nome"].astype(str).str.contains(
-                                busca_diag, case=False, na=False, regex=False
-                            )
-                        )
-                        df_diag_view = df_diag_view[mask_busca]
-
-                    # Aplica filtro de margem
-                    filtro_margem: float | None = None
-                    if operador != "Todos" and filtro_pct_txt.strip():
-                        try:
-                            filtro_margem = parse_br_currency(filtro_pct_txt)
-                        except Exception:
-                            filtro_margem = None
-
-                    if filtro_margem is not None:
-                        if operador == "< menor que":
-                            df_diag_view = df_diag_view[
-                                df_diag_view["Margem Atual (%)"] < filtro_margem
-                            ]
-                        else:
-                            df_diag_view = df_diag_view[
-                                df_diag_view["Margem Atual (%)"] > filtro_margem
-                            ]
-
-                    # Legenda dos filtros ativos
-                    partes = []
-                    if busca_diag:
-                        partes.append(f'busca: "{busca_diag}"')
-                    if filtro_margem is not None:
-                        sinal = "<" if operador == "< menor que" else ">"
-                        partes.append(f"margem {sinal} {filtro_margem:.1f}%")
-                    if partes:
-                        st.caption(
-                            f"{len(df_diag_view)} produto(s) · filtro: {', '.join(partes)}."
-                        )
-
-                    # ── Margem média dos produtos visíveis ────────────────────
-                    if len(df_diag_view) > 0:
-                        media_margem = df_diag_view["Margem Atual (%)"].mean()
-                        media_cor  = "#E74C3C" if media_margem < 0 else "#2ecc71"
-                        media_bg   = "#2e0a0a" if media_margem < 0 else "#0a2e16"
-                        media_bord = "#E74C3C" if media_margem < 0 else "#27ae60"
-                        label_filtro = (
-                            f" (dos {len(df_diag_view)} filtrados)"
-                            if (busca_diag or filtro_margem is not None)
-                            else ""
-                        )
-                        st.markdown(
-                            f"<div style='"
-                            f"display:inline-flex; align-items:center; gap:10px;"
-                            f"background:{media_bg}; border:1px solid {media_bord};"
-                            f"border-radius:8px; padding:10px 20px; margin-bottom:10px;"
-                            f"'>"
-                            f"<span style='color:#c8a8e9; font-size:0.85rem;'>"
-                            f"Margem média{label_filtro}</span>"
-                            f"<span style='color:{media_cor}; font-size:1.25rem;"
-                            f" font-weight:700; letter-spacing:0.5px;'>"
-                            f"{media_margem:.2f}%</span>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                    def color_diag(row):
-                        if row["Margem Atual (%)"] < 0:
-                            return ["background-color: #2e0a0a; color: #FFFFFF"] * len(row)
-                        return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
-
-                    fmt_diag = {
-                        "Custo (R$)":                "R$ {:,.2f}",
-                        "Preço Médio de Venda (R$)": "R$ {:,.2f}",
-                        "Comissão (R$)":             "R$ {:,.2f}",
-                        "TACOS (R$)":                "R$ {:,.2f}",
-                        "Lucro Atual (R$)":          "R$ {:,.2f}",
-                        "Margem Atual (%)":          "{:.2f}%",
-                    }
-                    # Oculta "TACOS" se não há tacos configurado
-                    cols_drop_diag = []
-                    if tacos_diag == 0.0:
-                        cols_drop_diag.append("TACOS (R$)")
-                    diag_display = df_diag_view.drop(
-                        columns=[c for c in cols_drop_diag if c in df_diag_view.columns],
-                    )
-
-                    styled_diag = (
-                        diag_display.style
-                        .apply(color_diag, axis=1)
-                        .format({k: v for k, v in fmt_diag.items() if k in diag_display.columns})
-                        .set_properties(**{
-                            "text-align": "center",
-                            "font-size": "0.88rem",
-                        })
-                        .set_properties(subset=["Nome"], **{"text-align": "left"})
-                    )
-                    st.dataframe(styled_diag, use_container_width=True, height=420)
-
-                    # Download Excel com aba de diagnóstico
-                    excel_diag_bytes = generate_excel(
-                        df=df_results,
-                        margem=margem,
-                        desconto_promo=desconto_promo,
-                        aliquota=aliquota,
-                        spike_day=spike_day,
-                        margem_individual=margem_individual,
-                        tacos_pct=tacos,
+                    df_diag = build_diagnostico_df(
+                        df_raw=df_raw,
+                        df_vendas=df_shopee,
+                        aliquota_imposto=aliquota + spike_day_rate,
                         afiliado_pct=afiliado,
-                        df_diagnostico=df_diag,
                         tacos_diag_pct=tacos_diag,
                     )
-                    st.download_button(
-                        label="⬇️ Baixar Excel com Diagnóstico",
-                        data=excel_diag_bytes,
-                        file_name="shopee_precificacao_diagnostico.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        help="Exporta as duas abas: Precificação Shopee + Diagnóstico Atual.",
-                    )
+
+                    if len(df_diag) == 0:
+                        st.warning(
+                            "⚠️ Nenhum produto correspondente encontrado. "
+                            "Verifique se o ID da planilha de custos coincide "
+                            "com o ID do Produto na Shopee."
+                        )
+                    else:
+                        n_matched = len(df_diag)
+                        n_total   = len(df_raw)
+                        st.caption(
+                            f"{n_matched} de {n_total} produto(s) com preço Shopee encontrado(s)."
+                        )
+
+                        # ── Filtros ──────────────────────────────────────────────
+                        col_busca, col_op, col_pct = st.columns([3, 1, 1])
+
+                        with col_busca:
+                            busca_diag = st.text_input(
+                                "Pesquisar por ID ou Nome",
+                                placeholder="Digite o ID ou nome do produto...",
+                                key="busca_diag",
+                            ).strip()
+
+                        with col_op:
+                            operador = st.selectbox(
+                                "Filtro de margem",
+                                options=["Todos", "< menor que", "> maior que"],
+                                key="op_margem_diag",
+                                label_visibility="visible",
+                            )
+
+                        with col_pct:
+                            filtro_pct_txt = st.text_input(
+                                "Margem (%)",
+                                placeholder="Ex: 10",
+                                key="filtro_pct_diag",
+                                disabled=(operador == "Todos"),
+                                label_visibility="visible",
+                            )
+
+                        # Aplica busca por texto
+                        df_diag_view = df_diag.copy()
+                        if busca_diag:
+                            mask_busca = (
+                                df_diag_view["ID Produto"].astype(str).str.contains(
+                                    busca_diag, case=False, na=False, regex=False
+                                )
+                                | df_diag_view["Nome"].astype(str).str.contains(
+                                    busca_diag, case=False, na=False, regex=False
+                                )
+                            )
+                            df_diag_view = df_diag_view[mask_busca]
+
+                        # Aplica filtro de margem
+                        filtro_margem: float | None = None
+                        if operador != "Todos" and filtro_pct_txt.strip():
+                            try:
+                                filtro_margem = parse_br_currency(filtro_pct_txt)
+                            except Exception:
+                                filtro_margem = None
+
+                        if filtro_margem is not None:
+                            if operador == "< menor que":
+                                df_diag_view = df_diag_view[
+                                    df_diag_view["Margem Atual (%)"] < filtro_margem
+                                ]
+                            else:
+                                df_diag_view = df_diag_view[
+                                    df_diag_view["Margem Atual (%)"] > filtro_margem
+                                ]
+
+                        # Legenda dos filtros ativos
+                        partes = []
+                        if busca_diag:
+                            partes.append(f'busca: "{busca_diag}"')
+                        if filtro_margem is not None:
+                            sinal = "<" if operador == "< menor que" else ">"
+                            partes.append(f"margem {sinal} {filtro_margem:.1f}%")
+                        if partes:
+                            st.caption(
+                                f"{len(df_diag_view)} produto(s) · filtro: {', '.join(partes)}."
+                            )
+
+                        # ── Margem média dos produtos visíveis ────────────────────
+                        if len(df_diag_view) > 0:
+                            media_margem = df_diag_view["Margem Atual (%)"].mean()
+                            media_cor  = "#E74C3C" if media_margem < 0 else "#2ecc71"
+                            media_bg   = "#2e0a0a" if media_margem < 0 else "#0a2e16"
+                            media_bord = "#E74C3C" if media_margem < 0 else "#27ae60"
+                            label_filtro = (
+                                f" (dos {len(df_diag_view)} filtrados)"
+                                if (busca_diag or filtro_margem is not None)
+                                else ""
+                            )
+                            st.markdown(
+                                f"<div style='"
+                                f"display:inline-flex; align-items:center; gap:10px;"
+                                f"background:{media_bg}; border:1px solid {media_bord};"
+                                f"border-radius:8px; padding:10px 20px; margin-bottom:10px;"
+                                f"'>"
+                                f"<span style='color:#c8a8e9; font-size:0.85rem;'>"
+                                f"Margem média{label_filtro}</span>"
+                                f"<span style='color:{media_cor}; font-size:1.25rem;"
+                                f" font-weight:700; letter-spacing:0.5px;'>"
+                                f"{media_margem:.2f}%</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        def color_diag(row):
+                            if row["Margem Atual (%)"] < 0:
+                                return ["background-color: #2e0a0a; color: #FFFFFF"] * len(row)
+                            return ["background-color: #1f063b; color: #FFFFFF"] * len(row)
+
+                        fmt_diag = {
+                            "Custo (R$)":                "R$ {:,.2f}",
+                            "Preço Médio de Venda (R$)": "R$ {:,.2f}",
+                            "Comissão (R$)":             "R$ {:,.2f}",
+                            "TACOS (R$)":                "R$ {:,.2f}",
+                            "Lucro Atual (R$)":          "R$ {:,.2f}",
+                            "Margem Atual (%)":          "{:.2f}%",
+                        }
+                        # Oculta "TACOS" se não há tacos configurado
+                        cols_drop_diag = []
+                        if tacos_diag == 0.0:
+                            cols_drop_diag.append("TACOS (R$)")
+                        diag_display = df_diag_view.drop(
+                            columns=[c for c in cols_drop_diag if c in df_diag_view.columns],
+                        )
+
+                        styled_diag = (
+                            diag_display.style
+                            .apply(color_diag, axis=1)
+                            .format({k: v for k, v in fmt_diag.items() if k in diag_display.columns})
+                            .set_properties(**{
+                                "text-align": "center",
+                                "font-size": "0.88rem",
+                            })
+                            .set_properties(subset=["Nome"], **{"text-align": "left"})
+                        )
+                        st.dataframe(styled_diag, use_container_width=True, height=420)
+
+                        # Download Excel com aba de diagnóstico
+                        excel_diag_bytes = generate_excel(
+                            df=df_results,
+                            margem=margem,
+                            desconto_promo=desconto_promo,
+                            aliquota=aliquota,
+                            spike_day=spike_day,
+                            margem_individual=margem_individual,
+                            tacos_pct=tacos,
+                            afiliado_pct=afiliado,
+                            df_diagnostico=df_diag,
+                            tacos_diag_pct=tacos_diag,
+                        )
+                        st.download_button(
+                            label="⬇️ Baixar Excel com Diagnóstico",
+                            data=excel_diag_bytes,
+                            file_name="shopee_precificacao_diagnostico.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            help="Exporta as duas abas: Precificação Shopee + Diagnóstico Atual.",
+                        )
 
     elif df_raw is not None and len(df_raw) == 0:
         st.warning("Planilha lida, mas nenhum produto com custo > 0 foi encontrado.")
@@ -1503,30 +1574,24 @@ else:
                 os preços serão calculados <b>em tempo real</b>.
             </div>
             <div style="margin-top: 20px; font-size: 0.8rem; color: #7B2FBE;">
-                Taxas Shopee aplicadas automaticamente por faixa de preço
+                Taxas {mp_nome} aplicadas automaticamente por faixa de preço
             </div>
         </div>
-        """,
+        """.replace("{mp_nome}", MP.nome),
         unsafe_allow_html=True,
     )
 
     # ── Tabela de referência das taxas ──────────────────────────────────────
     st.markdown(
-        section_header("Tabela de Taxas Shopee (referência)", "💡"),
+        section_header(f"Tabela de Taxas {MP.nome} (referência)", "💡"),
         unsafe_allow_html=True,
     )
 
-    df_fees = pd.DataFrame([
-        {"Faixa de Preço": "Até R$ 79,99",        "Comissão": "20% + R$ 4,50",  "Subsídio Pix": "—"},
-        {"Faixa de Preço": "R$ 80 a R$ 99,99",    "Comissão": "14% + R$ 16,00", "Subsídio Pix": "5%"},
-        {"Faixa de Preço": "R$ 100 a R$ 199,99",  "Comissão": "14% + R$ 20,00", "Subsídio Pix": "5%"},
-        {"Faixa de Preço": "R$ 200 a R$ 499,99",  "Comissão": "14% + R$ 26,00", "Subsídio Pix": "5%"},
-        {"Faixa de Preço": "Acima de R$ 500",      "Comissão": "14% + R$ 26,00", "Subsídio Pix": "8%"},
-    ])
+    df_fees = pd.DataFrame(MP.tabela_referencia)
     st.dataframe(df_fees, use_container_width=True, hide_index=True)
     st.markdown(
         "<div style='font-size:0.78rem; color:#7B2FBE; margin-top:6px;'>"
-        "* O Subsídio Pix é pago pela Shopee ao comprador — não afeta a receita do vendedor."
+        f"{MP.nota_referencia}"
         "</div>",
         unsafe_allow_html=True,
     )

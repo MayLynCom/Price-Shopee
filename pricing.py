@@ -65,6 +65,7 @@ class PricingResult:
     viavel: bool                # False se não há solução válida
     tacos_valor: float = 0.0    # valor de TACOS em R$
     afiliado_valor: float = 0.0  # valor de comissão de afiliado em R$
+    frete_valor: float = 0.0    # taxa do programa de frete grátis em R$ (TikTok)
 
 
 def calcular_preco(
@@ -77,6 +78,9 @@ def calcular_preco(
     aliquota_imposto: float,    # 0 a 1
     tacos_pct: float = 0.0,     # 0 a 1  — custo de anúncios (TACOS)
     afiliado_pct: float = 0.0,  # 0 a 1  — comissão de afiliado
+    tiers: Optional[list[ShopeeFeeTier]] = None,  # tabela do marketplace
+    taxa_extra_pct: float = 0.0,  # ex: 0.06 (frete grátis TikTok)
+    taxa_extra_teto: Optional[float] = None,  # teto em R$ da taxa extra
 ) -> PricingResult:
     """
     Calcula o preço de venda ideal para atingir a margem desejada após
@@ -92,19 +96,15 @@ def calcular_preco(
     afil = afiliado_pct
 
     best: Optional[PricingResult] = None
+    tiers = tiers or SHOPEE_FEE_TIERS
 
-    for tier in SHOPEE_FEE_TIERS:
+    for tier in tiers:
         t = tier.commission_pct
         f = tier.fixed_fee
 
-        denominador = 1 - t - i - m - tacos - afil
-
-        if denominador <= 1e-9:
-            continue
-
-        P = (C + f) / denominador
-
-        if P < 0:
+        P, extra = _resolver_preco(C, f, t, i, m, tacos, afil,
+                                   taxa_extra_pct, taxa_extra_teto)
+        if P is None or P < 0:
             continue
 
         dentro_da_faixa = tier.price_min <= P <= tier.price_max
@@ -113,7 +113,8 @@ def calcular_preco(
             return _build_result(
                 produto_id, nome_produto, C, P, m, i, t, f,
                 desconto_promo, tier, viavel=True,
-                tacos=tacos, afil=afil,
+                tacos=tacos, afil=afil, extra=extra,
+                extra_pct=taxa_extra_pct, extra_teto=taxa_extra_teto,
             )
 
         # Guarda o melhor candidato fora da faixa para fallback
@@ -121,7 +122,8 @@ def calcular_preco(
             best = _build_result(
                 produto_id, nome_produto, C, P, m, i, t, f,
                 desconto_promo, tier, viavel=False,
-                tacos=tacos, afil=afil,
+                tacos=tacos, afil=afil, extra=extra,
+                extra_pct=taxa_extra_pct, extra_teto=taxa_extra_teto,
             )
 
     # Nenhuma faixa se encaixou — retorna o fallback com viavel=False
@@ -142,11 +144,36 @@ def calcular_preco(
         lucro=0.0,
         margem_real=0.0,
         pix_subsidy_pct=0.0,
-        tier=SHOPEE_FEE_TIERS[0],
+        tier=tiers[0],
         viavel=False,
         tacos_valor=0.0,
         afiliado_valor=0.0,
     )
+
+
+def _resolver_preco(
+    C: float, f: float, t: float, i: float, m: float,
+    tacos: float, afil: float,
+    extra_pct: float = 0.0, extra_teto: Optional[float] = None,
+) -> tuple[Optional[float], float]:
+    """
+    Resolve P = (C + f) / (1 − t − i − m − tacos − afil − extra%).
+    Se a taxa extra (ex: frete grátis TikTok, 6%) passar do teto em R$,
+    ela vira um valor fixo igual ao teto e P é recalculado.
+    Retorna (P, valor_da_taxa_extra) ou (None, 0) se não houver solução.
+    """
+    den = 1 - t - i - m - tacos - afil - extra_pct
+    if den <= 1e-9:
+        return None, 0.0
+    P = (C + f) / den
+    extra = P * extra_pct
+    if extra_teto is not None and extra > extra_teto:
+        den2 = 1 - t - i - m - tacos - afil
+        if den2 <= 1e-9:
+            return None, 0.0
+        P = (C + f + extra_teto) / den2
+        extra = extra_teto
+    return P, extra
 
 
 def _build_result(
@@ -163,6 +190,9 @@ def _build_result(
     viavel: bool,
     tacos: float = 0.0,
     afil: float = 0.0,
+    extra: float = 0.0,
+    extra_pct: float = 0.0,
+    extra_teto: Optional[float] = None,
 ) -> PricingResult:
     comissao = P * t + f
     imposto_valor = P * i
@@ -173,8 +203,9 @@ def _build_result(
 
     # Break-even REAL: preço onde lucro = 0 (despesa = preço).
     # P_be = (C + f) / (1 - t - i - tacos - afil)
-    denom_be = 1 - t - i - tacos - afil
-    preco_break_even = (C + f) / denom_be if denom_be > 1e-9 else 0.0
+    P_be, _ = _resolver_preco(C, f, t, i, 0.0, tacos, afil,
+                              extra_pct, extra_teto)
+    preco_break_even = P_be or 0.0
 
     fake_price = P / (1 - desconto_promo) if desconto_promo < 1.0 else P
 
@@ -195,6 +226,7 @@ def _build_result(
         viavel=viavel,
         tacos_valor=round(tacos_valor, 2),
         afiliado_valor=round(afiliado_valor, 2),
+        frete_valor=round(extra, 2),
     )
 
 
