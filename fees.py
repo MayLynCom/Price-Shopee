@@ -107,5 +107,6 @@ MARKETPLACES: dict[str, Marketplace] = {
         nota_referencia="* Taxas vigentes desde 15/07/2026, calculadas sobre o preço após os "
                         "descontos do vendedor. Confira sempre no Seller Center do TikTok Shop.",
         tem_frete_gratis=True,
+        tem_diagnostico=True,
     ),
 }
