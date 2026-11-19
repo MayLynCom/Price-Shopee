@@ -279,13 +279,16 @@ def parse_excel(file) -> pd.DataFrame | None:
     try:
         df = pd.read_excel(file, dtype=str)
         df.columns = [str(c).strip().lower() for c in df.columns]
+        # Planilhas com colunas repetidas (ex: duas "Custo Ajustado") quebram
+        # o pandas — mantém só a primeira ocorrência de cada nome.
+        df = df.loc[:, ~df.columns.duplicated()]
 
         col_map = {
-            "id": ["id", "id_produto", "sku", "código", "codigo", "cod",
+            "id": ["id", "id_produto", "sku", "sku (obrigatório)", "sku do vendedor", "código", "codigo", "cod",
                    "mlb (item id)", "mlb(item id)", "mlb", "item id", "item_id"],
             "nome": ["nome", "nome_produto", "produto", "descrição", "descricao", "name",
                      "nome do produto"],
-            "custo": ["custo", "custo_produto", "cost", "costo", "valor_custo", "custo (r$)",
+            "custo": ["custo total", "custo", "custo_produto", "cost", "costo", "valor_custo", "custo (r$)",
                       "custo unitário", "custo unitario"],
             "peso_extra_kg": ["peso_extra_kg", "peso_extra", "peso adicional", "extra_kg"],
         }
@@ -297,7 +300,13 @@ def parse_excel(file) -> pd.DataFrame | None:
                     rename[alias] = target
                     break
 
-        df = df.rename(columns=rename)
+        # Se outra coluna já tem o nome de destino (ex: existe "custo" mas a
+        # escolhida foi "custo total"), descarta a outra para não duplicar.
+        conflitos = [
+            c for c in df.columns
+            if c in rename.values() and c not in rename
+        ]
+        df = df.drop(columns=conflitos).rename(columns=rename)
 
         if "id" not in df.columns:
             st.error("❌ Coluna de ID do produto não encontrada. "
@@ -460,12 +469,85 @@ def parse_vendas_excel(file) -> pd.DataFrame | None:
         return None
 
 
+def parse_tiktok_precos_excel(file) -> pd.DataFrame | None:
+    """
+    Lê a planilha de "Editar em massa → Informações de vendas" exportada do
+    TikTok Shop Seller Center (aba "Template").
+
+    O arquivo tem linhas de metadados antes do cabeçalho real (chaves técnicas,
+    versão, "Obrigatório", "Não editável"...), então localizamos a linha que
+    contém "SKU do vendedor" e usamos ela como cabeçalho.
+
+    Retorna um DataFrame com: id (= SKU do vendedor), nome_produto,
+    preco_efetivo (= "Preço de varejo", o preço atual do anúncio).
+    O cruzamento com a planilha de custos é feito pelo SKU do vendedor.
+    """
+    try:
+        try:
+            raw = pd.read_excel(file, sheet_name="Template", header=None, dtype=str)
+        except ValueError:
+            raw = pd.read_excel(file, sheet_name=0, header=None, dtype=str)
+
+        header_idx = None
+        for i in range(min(len(raw), 15)):
+            vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
+            if "sku do vendedor" in vals:
+                header_idx = i
+                break
+            if header_idx is None and "seller_sku" in vals:
+                header_idx = i
+        if header_idx is None:
+            st.error(
+                "❌ Formato inesperado da planilha do TikTok Shop. Use o arquivo de "
+                "Editar em massa → Informações de vendas exportado do Seller Center."
+            )
+            return None
+
+        df = raw.iloc[header_idx + 1:].copy()
+        df.columns = [str(c).strip().lower() for c in raw.iloc[header_idx].tolist()]
+
+        col_sku = "sku do vendedor" if "sku do vendedor" in df.columns else "seller_sku"
+        col_preco = next(
+            (c for c in ("preço de varejo (moeda local)", "price") if c in df.columns),
+            None,
+        )
+        col_nome = next(
+            (c for c in ("nome do produto", "product_name") if c in df.columns),
+            None,
+        )
+        if col_preco is None:
+            st.error("❌ Coluna de preço não encontrada na planilha do TikTok Shop.")
+            return None
+
+        out = pd.DataFrame({
+            "id": df[col_sku].astype(str).str.strip(),
+            "nome_produto": (
+                df[col_nome].astype(str).str.strip() if col_nome else df[col_sku]
+            ),
+            # Linhas de instrução ("Obrigatório", "Não editável"...) viram 0,0
+            # e são descartadas pelo filtro abaixo.
+            "preco_efetivo": df[col_preco].map(parse_br_currency),
+        })
+        out = out[
+            ~out["id"].isin(["nan", "None", ""]) & (out["preco_efetivo"] > 0)
+        ]
+        # Variações com o mesmo SKU: mantém o maior preço (critério conservador)
+        out = out.sort_values("preco_efetivo", ascending=False)
+        out = out.drop_duplicates(subset="id", keep="first")
+        return out.reset_index(drop=True)
+
+    except Exception as e:
+        st.error(f"❌ Erro ao ler a planilha do TikTok Shop: {e}")
+        return None
+
+
 def build_diagnostico_df(
     df_raw: pd.DataFrame,
     df_vendas: pd.DataFrame,
     aliquota_imposto: float,
     afiliado_pct: float = 0.0,
     tacos_diag_pct: float = 0.0,
+    frete_gratis: bool = False,
 ) -> pd.DataFrame:
     """
     Cruza a planilha de custos com o preço médio de venda efetivo (relatório
@@ -479,8 +561,11 @@ def build_diagnostico_df(
                       Usado sozinho no diagnóstico, independente do TACOS
                       configurado na barra lateral (não são somados).
     """
+    cols_vendas = ["id", "preco_efetivo"] + (
+        ["nome_produto"] if "nome_produto" in df_vendas.columns else []
+    )
     merged = df_raw[["id", "nome", "custo"]].merge(
-        df_vendas[["id", "preco_efetivo"]],
+        df_vendas[cols_vendas],
         on="id",
         how="inner",
     )
@@ -492,24 +577,34 @@ def build_diagnostico_df(
         if P <= 0:
             continue
 
-        tier = SHOPEE_FEE_TIERS[0]
-        for t in SHOPEE_FEE_TIERS:
+        tier = MP.tiers[0]
+        for t in MP.tiers:
             if t.price_min <= P <= t.price_max:
                 tier = t
                 break
 
         commission   = P * tier.commission_pct + tier.fixed_fee
+        if frete_gratis:
+            # Programa de Frete Grátis (TikTok): 6% do preço, teto R$ 50/item
+            commission += min(P * TIKTOK_FRETE_GRATIS_PCT, TIKTOK_FRETE_GRATIS_TETO)
         imposto_val  = P * aliquota_imposto
         tacos_val    = P * tacos_diag_pct
         afil_val     = P * afiliado_pct
         lucro = P - custo - commission - imposto_val - tacos_val - afil_val
+
+        # Planilha de custos sem coluna de nome (nome = ID): usa o nome do
+        # produto que veio do arquivo do marketplace.
+        nome = str(p.get("nome", "") or "")
+        nome_mkt = str(p.get("nome_produto", "") or "")
+        if (not nome or nome == str(p.get("id", ""))) and nome_mkt not in ("", "nan"):
+            nome = nome_mkt
         margem = lucro / P * 100 if P > 0 else 0.0
 
         rows.append({
             "ID Produto":                str(p.get("id", "")),
-            "Nome":                      str(p.get("nome", "")),
+            "Nome":                      nome,
             "Custo (R$)":                round(custo, 2),
-            "Preço Médio de Venda (R$)": round(P, 2),
+            COL_PRECO_DIAG: round(P, 2),
             "Comissão (R$)":             round(commission, 2),
             "TACOS (R$)":                round(tacos_val, 2),
             "Lucro Atual (R$)":          round(lucro, 2),
@@ -726,7 +821,7 @@ def generate_excel(
         la2 = Alignment(horizontal="left", vertical="center")
 
         diag_cols = [
-            "ID Produto", "Nome", "Custo (R$)", "Preço Médio de Venda (R$)",
+            "ID Produto", "Nome", "Custo (R$)", COL_PRECO_DIAG,
             "Comissão (R$)", "TACOS (R$)",
             "Lucro Atual (R$)", "Margem Atual (%)",
         ]
@@ -788,7 +883,7 @@ def generate_excel(
                 row2["ID Produto"],
                 row2["Nome"],
                 row2.get("Custo (R$)", 0.0),
-                row2.get("Preço Médio de Venda (R$)", 0.0),
+                row2.get(COL_PRECO_DIAG, 0.0),
                 row2.get("Comissão (R$)", 0.0),
                 row2.get("TACOS (R$)", 0.0),
                 row2.get("Lucro Atual (R$)", 0.0),
@@ -885,6 +980,11 @@ st.session_state["_mp_ultimo"] = st.session_state["marketplace"]
 MP = MARKETPLACES[st.session_state["marketplace"]]
 COL_COM = f"Comissão {MP.nome} (R$)"
 COL_TAXA = f"Taxa Fixa {MP.nome} (R$)"
+# Shopee: preço médio efetivo do relatório de vendas.
+# TikTok: preço atual do anúncio (planilha de edição em massa).
+COL_PRECO_DIAG = (
+    "Preço Médio de Venda (R$)" if MP.chave == "shopee" else "Preço Atual (R$)"
+)
 
 st.markdown(
     TITLE_HTML.replace("🛍️", MP.emoji).replace("Shopee", MP.nome),
@@ -1315,44 +1415,62 @@ if uploaded is not None:
             # ── Diagnóstico de Preços Atuais ────────────────────────────────────
             st.divider()
             st.markdown(
-                section_header("Diagnóstico de Preços Atuais (Shopee)", "🔍"),
+                section_header(f"Diagnóstico de Preços Atuais ({MP.nome})", "🔍"),
                 unsafe_allow_html=True,
             )
 
             col_up_s, col_hint_s = st.columns([2, 3])
             with col_up_s:
                 uploaded_shopee = st.file_uploader(
-                    "Relatório de Vendas Shopee",
+                    f"Planilha de preços {MP.nome}",
                     type=["xlsx", "xls"],
-                    key="shopee_uploader",
+                    key=f"{MP.chave}_uploader",
                     label_visibility="collapsed",
                 )
             with col_hint_s:
+                if MP.chave == "shopee":
+                    hint_diag = (
+                        "Exporte o relatório de <b>Desempenho de Produtos</b> (aba "
+                        "<b>Produtos com Melhor Desempenho</b>) da Shopee Seller Center "
+                        "e faça o upload aqui.<br>"
+                        "O <code style='color:#e8d5ff'>ID</code> da sua planilha de custos "
+                        "deve ser o <b style='color:#e8d5ff'>ID do Item</b> na Shopee.<br>"
+                        "A margem é calculada com base no <b style='color:#e8d5ff'>preço médio "
+                        "de venda real</b> de cada produto no período (coluna "
+                        "<i>Vendas por Pedido (Pedido Pago)</i>), já líquido de promoções e cupons."
+                    )
+                else:
+                    hint_diag = (
+                        "No TikTok Shop Seller Center, vá em <b>Produtos → Editar em massa → "
+                        "Informações de vendas</b>, baixe a planilha e faça o upload aqui.<br>"
+                        "O <code style='color:#e8d5ff'>SKU</code> da sua planilha de custos "
+                        "deve ser o <b style='color:#e8d5ff'>SKU do vendedor</b> no TikTok.<br>"
+                        "A margem é calculada com base no <b style='color:#e8d5ff'>preço atual "
+                        "do anúncio</b> (coluna <i>Preço de varejo</i>), com as taxas do "
+                        "TikTok Shop" + (" e o Frete Grátis" if frete_gratis else "") + "."
+                    )
                 st.markdown(
                     "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
                     " padding:12px 16px; color:#c8a8e9; font-size:0.85rem;'>"
                     "<b style='color:#D4AF37'>Como usar:</b><br>"
-                    "Exporte o relatório de <b>Desempenho de Produtos</b> (aba "
-                    "<b>Produtos com Melhor Desempenho</b>) da Shopee Seller Center "
-                    "e faça o upload aqui.<br>"
-                    "O <code style='color:#e8d5ff'>ID</code> da sua planilha de custos "
-                    "deve ser o <b style='color:#e8d5ff'>ID do Item</b> na Shopee.<br>"
-                    "A margem é calculada com base no <b style='color:#e8d5ff'>preço médio "
-                    "de venda real</b> de cada produto no período (coluna "
-                    "<i>Vendas por Pedido (Pedido Pago)</i>), já líquido de promoções e cupons."
+                    + hint_diag +
                     "</div>",
                     unsafe_allow_html=True,
                 )
 
             if uploaded_shopee is not None:
                 if (
-                    "shopee_file" not in st.session_state
-                    or st.session_state.shopee_file != uploaded_shopee.name
+                    st.session_state.get(f"diag_file_{MP.chave}")
+                    != uploaded_shopee.name
                 ):
-                    st.session_state.shopee_file = uploaded_shopee.name
-                    st.session_state.df_shopee = parse_vendas_excel(uploaded_shopee)
+                    st.session_state[f"diag_file_{MP.chave}"] = uploaded_shopee.name
+                    st.session_state[f"df_diag_src_{MP.chave}"] = (
+                        parse_vendas_excel(uploaded_shopee)
+                        if MP.chave == "shopee"
+                        else parse_tiktok_precos_excel(uploaded_shopee)
+                    )
 
-                df_shopee = st.session_state.get("df_shopee")
+                df_shopee = st.session_state.get(f"df_diag_src_{MP.chave}")
 
                 if df_shopee is not None and len(df_shopee) > 0:
 
@@ -1369,9 +1487,9 @@ if uploaded is not None:
                         tacos_diag_txt = st.text_input(
                             "TACOS médio atual (%)",
                             placeholder="Ex: 5",
-                            key="tacos_diag_input",
-                            help="% do faturamento gasto com anúncios atualmente na sua "
-                                 "conta Shopee (ex: 5 = 5%). Usado apenas no diagnóstico, "
+                            key=f"tacos_diag_input_{MP.chave}",
+                            help=f"% do faturamento gasto com anúncios atualmente na sua "
+                                 f"conta {MP.nome} (ex: 5 = 5%). Usado apenas no diagnóstico, "
                                  "independente do TACOS configurado na barra lateral.",
                         )
 
@@ -1383,19 +1501,23 @@ if uploaded is not None:
                         aliquota_imposto=aliquota + spike_day_rate,
                         afiliado_pct=afiliado,
                         tacos_diag_pct=tacos_diag,
+                        frete_gratis=frete_gratis,
                     )
 
                     if len(df_diag) == 0:
                         st.warning(
                             "⚠️ Nenhum produto correspondente encontrado. "
-                            "Verifique se o ID da planilha de custos coincide "
-                            "com o ID do Produto na Shopee."
+                            + ("Verifique se o ID da planilha de custos coincide "
+                               "com o ID do Produto na Shopee."
+                               if MP.chave == "shopee" else
+                               "Verifique se o SKU da planilha de custos coincide "
+                               "com o SKU do vendedor no TikTok Shop.")
                         )
                     else:
                         n_matched = len(df_diag)
                         n_total   = len(df_raw)
                         st.caption(
-                            f"{n_matched} de {n_total} produto(s) com preço Shopee encontrado(s)."
+                            f"{n_matched} de {n_total} produto(s) com preço {MP.nome} encontrado(s)."
                         )
 
                         # ── Filtros ──────────────────────────────────────────────
@@ -1405,14 +1527,14 @@ if uploaded is not None:
                             busca_diag = st.text_input(
                                 "Pesquisar por ID ou Nome",
                                 placeholder="Digite o ID ou nome do produto...",
-                                key="busca_diag",
+                                key=f"busca_diag_{MP.chave}",
                             ).strip()
 
                         with col_op:
                             operador = st.selectbox(
                                 "Filtro de margem",
                                 options=["Todos", "< menor que", "> maior que"],
-                                key="op_margem_diag",
+                                key=f"op_margem_diag_{MP.chave}",
                                 label_visibility="visible",
                             )
 
@@ -1420,7 +1542,7 @@ if uploaded is not None:
                             filtro_pct_txt = st.text_input(
                                 "Margem (%)",
                                 placeholder="Ex: 10",
-                                key="filtro_pct_diag",
+                                key=f"filtro_pct_diag_{MP.chave}",
                                 disabled=(operador == "Todos"),
                                 label_visibility="visible",
                             )
@@ -1501,7 +1623,7 @@ if uploaded is not None:
 
                         fmt_diag = {
                             "Custo (R$)":                "R$ {:,.2f}",
-                            "Preço Médio de Venda (R$)": "R$ {:,.2f}",
+                            COL_PRECO_DIAG: "R$ {:,.2f}",
                             "Comissão (R$)":             "R$ {:,.2f}",
                             "TACOS (R$)":                "R$ {:,.2f}",
                             "Lucro Atual (R$)":          "R$ {:,.2f}",
@@ -1539,13 +1661,14 @@ if uploaded is not None:
                             afiliado_pct=afiliado,
                             df_diagnostico=df_diag,
                             tacos_diag_pct=tacos_diag,
+                            frete_gratis=frete_gratis,
                         )
                         st.download_button(
                             label="⬇️ Baixar Excel com Diagnóstico",
                             data=excel_diag_bytes,
-                            file_name="shopee_precificacao_diagnostico.xlsx",
+                            file_name=f"{MP.chave}_precificacao_diagnostico.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            help="Exporta as duas abas: Precificação Shopee + Diagnóstico Atual.",
+                            help=f"Exporta as duas abas: Precificação {MP.nome} + Diagnóstico Atual.",
                         )
 
     elif df_raw is not None and len(df_raw) == 0:
