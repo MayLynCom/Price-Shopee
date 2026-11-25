@@ -256,12 +256,18 @@ KPI_CSS = """
 }
 .kpi-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .kpi-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.kpi-grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .kpi-grid.cols-1 { grid-template-columns: minmax(0, 520px); }
+@media (max-width: 1200px) {
+    .kpi-grid.cols-5 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 @media (max-width: 900px) {
-    .kpi-grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .kpi-grid.cols-4, .kpi-grid.cols-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 560px) {
-    .kpi-grid.cols-2, .kpi-grid.cols-4 { grid-template-columns: minmax(0, 1fr); }
+    .kpi-grid.cols-2, .kpi-grid.cols-4, .kpi-grid.cols-5 {
+        grid-template-columns: minmax(0, 1fr);
+    }
 }
 .kpi-card {
     position: relative;
@@ -338,6 +344,12 @@ KPI_CSS = """
     font-variant-numeric: tabular-nums;
 }
 .kpi-card.big .kpi-value { font-size: 2.1rem; }
+/* Linha com 5 cards: textos um pouco menores para não quebrar */
+.kpi-grid.cols-5 .kpi-card { padding: 14px 14px 12px 14px; }
+.kpi-grid.cols-5 .kpi-head { font-size: 0.66rem; letter-spacing: 0.4px; gap: 6px; }
+.kpi-grid.cols-5 .kpi-value { font-size: 1.3rem; }
+.kpi-grid.cols-5 .kpi-foot { font-size: 0.72rem; }
+.kpi-value { white-space: nowrap; }
 .kpi-foot {
     display: flex;
     align-items: center;

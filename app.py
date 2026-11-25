@@ -552,6 +552,58 @@ def parse_tiktok_vendas_excel(file) -> pd.DataFrame | None:
         return None
 
 
+def parse_tiktok_ads_excel(file) -> pd.DataFrame | None:
+    """
+    Lê o relatório de dados de produto das campanhas (Ads) do TikTok Shop —
+    arquivo Product_data_AAAA-MM-DD_-_AAAA-MM-DD.xlsx.
+
+    O arquivo vem com uma linha por produto, campanha e dia. Somamos por
+    "ID do produto":
+      • "Custo"            → gasto com anúncios (Ads)
+      • "Custo (afiliado)" → comissão paga a afiliados
+
+    Retorna um DataFrame com: id, ads_total, afiliado_total (em R$).
+    """
+    try:
+        raw = pd.read_excel(file, sheet_name=0, header=None, dtype=str)
+
+        header_idx = None
+        for i in range(min(len(raw), 15)):
+            vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
+            if "id do produto" in vals and "custo" in vals:
+                header_idx = i
+                break
+        if header_idx is None:
+            st.error(
+                "❌ Formato inesperado do arquivo de Ads. Use o relatório de dados "
+                "de produto das campanhas, com as colunas ID do produto, Custo e "
+                "Custo (afiliado)."
+            )
+            return None
+
+        cab = [str(v).strip().lower() for v in raw.iloc[header_idx].tolist()]
+        dados = raw.iloc[header_idx + 1:]
+        i_id = cab.index("id do produto")
+        i_ads = cab.index("custo")
+        i_afil = cab.index("custo (afiliado)") if "custo (afiliado)" in cab else None
+
+        out = pd.DataFrame({
+            "id": dados.iloc[:, i_id].astype(str).str.strip(),
+            "ads_total": dados.iloc[:, i_ads].map(parse_br_currency),
+            "afiliado_total": (
+                dados.iloc[:, i_afil].map(parse_br_currency)
+                if i_afil is not None else 0.0
+            ),
+        })
+        out = out[~out["id"].isin(["nan", "None", ""])]
+        out = out.groupby("id", as_index=False)[["ads_total", "afiliado_total"]].sum()
+        return out.reset_index(drop=True)
+
+    except Exception as e:
+        st.error(f"❌ Erro ao ler o arquivo de Ads: {e}")
+        return None
+
+
 def build_diagnostico_df(
     df_raw: pd.DataFrame,
     df_vendas: pd.DataFrame,
@@ -559,6 +611,7 @@ def build_diagnostico_df(
     afiliado_pct: float = 0.0,
     tacos_diag_pct: float = 0.0,
     frete_gratis: bool = False,
+    df_ads: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Cruza a planilha de custos com o preço médio de venda efetivo (relatório
@@ -580,6 +633,15 @@ def build_diagnostico_df(
         how="inner",
     )
 
+    # TikTok: gasto real de Ads e Afiliado por produto (arquivo das campanhas).
+    # Quando existe, substitui o TACOS % e a comissão de afiliado % da barra.
+    usa_ads = df_ads is not None and "pedidos" in merged.columns
+    if usa_ads:
+        merged = merged.merge(df_ads, on="id", how="left")
+        merged[["ads_total", "afiliado_total"]] = (
+            merged[["ads_total", "afiliado_total"]].fillna(0.0)
+        )
+
     rows = []
     for p in merged.to_dict("records"):
         custo = float(p.get("custo") or 0.0)
@@ -600,6 +662,13 @@ def build_diagnostico_df(
         imposto_val  = P * aliquota_imposto
         tacos_val    = P * tacos_diag_pct
         afil_val     = P * afiliado_pct
+        if usa_ads:
+            pedidos_p = float(p.get("pedidos") or 0.0)
+            ads_tot = float(p.get("ads_total") or 0.0)
+            afil_tot = float(p.get("afiliado_total") or 0.0)
+            # Rateia o gasto do período pelos pedidos do produto
+            tacos_val = ads_tot / pedidos_p if pedidos_p > 0 else 0.0
+            afil_val = afil_tot / pedidos_p if pedidos_p > 0 else 0.0
         lucro = P - custo - commission - imposto_val - tacos_val - afil_val
 
         # Planilha de custos sem coluna de nome (nome = ID): usa o nome do
@@ -619,12 +688,17 @@ def build_diagnostico_df(
         if "gmv" in p:
             linha["GMV (R$)"] = round(float(p.get("gmv") or 0.0), 2)
             linha["Pedidos"] = int(float(p.get("pedidos") or 0))
-        linha.update({
-            COL_PRECO_DIAG:              round(P, 2),
-            "Comissão (R$)":             round(commission, 2),
-            "TACOS (R$)":                round(tacos_val, 2),
-            "Lucro Atual (R$)":          round(lucro, 2),
-        })
+        linha[COL_PRECO_DIAG] = round(P, 2)
+        linha["Comissão (R$)"] = round(commission, 2)
+        if usa_ads:
+            linha["Ads por pedido (R$)"] = round(tacos_val, 2)
+            linha["Afiliado por pedido (R$)"] = round(afil_val, 2)
+            # Totais do período: usados só nos cards (não aparecem na tabela)
+            linha["Ads Total (R$)"] = round(ads_tot, 2)
+            linha["Afiliado Total (R$)"] = round(afil_tot, 2)
+        else:
+            linha["TACOS (R$)"] = round(tacos_val, 2)
+        linha["Lucro Atual (R$)"] = round(lucro, 2)
         if "gmv" in p:
             # Lucro de todos os pedidos do período (lucro por pedido × pedidos).
             # Usado só nos totais (Lucro estimado / margem pelo volume); não
@@ -843,10 +917,14 @@ def generate_excel(
         la2 = Alignment(horizontal="left", vertical="center")
 
         tem_gmv = "GMV (R$)" in df_diagnostico.columns
+        tem_ads = "Ads por pedido (R$)" in df_diagnostico.columns
         diag_cols = (
             ["ID Produto", "Nome", "Custo (R$)"]
             + (["GMV (R$)", "Pedidos"] if tem_gmv else [])
-            + [COL_PRECO_DIAG, "Comissão (R$)", "TACOS (R$)", "Lucro Atual (R$)"]
+            + [COL_PRECO_DIAG, "Comissão (R$)"]
+            + (["Ads por pedido (R$)", "Afiliado por pedido (R$)"] if tem_ads
+               else ["TACOS (R$)"])
+            + ["Lucro Atual (R$)"]
             + ["Margem Atual (%)"]
         )
         n_cols2 = len(diag_cols)
@@ -865,6 +943,12 @@ def generate_excel(
             ("TACOS atual da conta",  f"{tacos_diag_pct * 100:.1f}%" if tacos_diag_pct > 0 else "—"),
             ("Imposto sobre receita", f"{aliquota * 100:.2f}%"),
         ]
+        if tem_ads:
+            diag_params[0] = (
+                "Ads e Afiliado (arquivo das campanhas)",
+                f"Ads {fmt_brl(float(df_diagnostico['Ads Total (R$)'].sum()))}"
+                f" · Afiliado {fmt_brl(float(df_diagnostico['Afiliado Total (R$)'].sum()))}",
+            )
         half = n_cols2 // 2
         for i, (label, value) in enumerate(diag_params, start=2):
             ws2.merge_cells(f"A{i}:{get_column_letter(half)}{i}")
@@ -979,8 +1063,9 @@ def generate_excel(
             pond_cell.number_format = pct_num2
             ws2.row_dimensions[pond_row].height = 22
 
-        col_widths2 = [16, 32, 13] + ([15, 10] if tem_gmv else []) + [
-            16, 13, 13, 15, 14]
+        larguras = {"ID Produto": 20, "Nome": 40, "Pedidos": 10, "Margem Atual (%)": 15,
+                    "Ads por pedido (R$)": 17, "Afiliado por pedido (R$)": 20}
+        col_widths2 = [larguras.get(c, 15) for c in diag_cols]
         for i2, w2 in enumerate(col_widths2, start=1):
             ws2.column_dimensions[get_column_letter(i2)].width = w2
         ws2.freeze_panes = f"A{first_data2}"
@@ -1474,14 +1559,39 @@ if uploaded is not None:
                 unsafe_allow_html=True,
             )
 
-            col_up_s, col_hint_s = st.columns([2, 3])
-            with col_up_s:
-                uploaded_shopee = st.file_uploader(
-                    f"Planilha de preços {MP.nome}",
-                    type=["xlsx", "xls"],
-                    key=f"{MP.chave}_uploader",
-                    label_visibility="collapsed",
-                )
+            uploaded_ads = None
+            if MP.chave == "tiktok":
+                # TikTok: dois arquivos lado a lado (vendas + gasto de Ads/Afiliado)
+                col_up_s, col_up_ads = st.columns(2)
+                with col_up_s:
+                    uploaded_shopee = st.file_uploader(
+                        "📊 Lista de produtos (GMV e Pedidos)",
+                        type=["xlsx", "xls"],
+                        key=f"{MP.chave}_uploader",
+                    )
+                with col_up_ads:
+                    uploaded_ads = st.file_uploader(
+                        "📣 Custos de Ads e Afiliado (opcional)",
+                        type=["xlsx", "xls"],
+                        key=f"{MP.chave}_ads_uploader",
+                        help="Relatório de dados de produto das campanhas "
+                             "(Product_data_...xlsx), com as colunas ID do produto, "
+                             "Custo (Ads) e Custo (afiliado). O gasto de cada produto "
+                             "no período é dividido pelos pedidos dele e descontado "
+                             "do lucro. Com este arquivo, o TACOS médio e a comissão "
+                             "de afiliado da barra lateral não são usados no "
+                             "diagnóstico.",
+                    )
+                col_hint_s = st.container()
+            else:
+                col_up_s, col_hint_s = st.columns([2, 3])
+                with col_up_s:
+                    uploaded_shopee = st.file_uploader(
+                        f"Planilha de preços {MP.nome}",
+                        type=["xlsx", "xls"],
+                        key=f"{MP.chave}_uploader",
+                        label_visibility="collapsed",
+                    )
             with col_hint_s:
                 if MP.chave == "shopee":
                     hint_diag = (
@@ -1504,7 +1614,10 @@ if uploaded is not None:
                         "O <b style='color:#e8d5ff'>ticket médio</b> de cada produto é "
                         "<b>GMV ÷ Pedidos</b> no período, e a margem usa as taxas do "
                         "TikTok Shop" + (" (com Frete Grátis)" if frete_gratis else "")
-                        + " e o imposto da barra lateral."
+                        + " e o imposto da barra lateral.<br>"
+                        "Opcional: suba também o relatório de <b>dados de produto das "
+                        "campanhas</b> para descontar o gasto real de <b>Ads</b> e "
+                        "<b>Afiliado</b> de cada produto."
                     )
                 st.markdown(
                     "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
@@ -1529,6 +1642,15 @@ if uploaded is not None:
 
                 df_shopee = st.session_state.get(f"df_diag_src_{MP.chave}")
 
+                df_ads = None
+                if uploaded_ads is not None:
+                    if st.session_state.get(f"ads_file_{MP.chave}") != uploaded_ads.name:
+                        st.session_state[f"ads_file_{MP.chave}"] = uploaded_ads.name
+                        st.session_state[f"df_ads_{MP.chave}"] = (
+                            parse_tiktok_ads_excel(uploaded_ads)
+                        )
+                    df_ads = st.session_state.get(f"df_ads_{MP.chave}")
+
                 if df_shopee is not None and len(df_shopee) > 0:
 
                     # ── Configurações do diagnóstico ───────────────────────────
@@ -1543,6 +1665,7 @@ if uploaded is not None:
                     with col_td:
                         tacos_diag_txt = st.text_input(
                             "TACOS médio atual (%)",
+                            disabled=df_ads is not None,
                             placeholder="Ex: 5",
                             key=f"tacos_diag_input_{MP.chave}",
                             help=f"% do faturamento gasto com anúncios atualmente na sua "
@@ -1551,14 +1674,26 @@ if uploaded is not None:
                         )
 
                     tacos_diag = min(max(parse_br_currency(tacos_diag_txt) / 100.0, 0.0), 1.0)
+                    if df_ads is not None:
+                        # Gasto real de Ads/Afiliado substitui os percentuais
+                        tacos_diag = 0.0
+                        st.caption(
+                            f"📣 Arquivo das campanhas carregado: Ads "
+                            f"{fmt_brl(float(df_ads['ads_total'].sum()))} e Afiliado "
+                            f"{fmt_brl(float(df_ads['afiliado_total'].sum()))} no total. "
+                            "Entra no cálculo o gasto dos produtos que têm custo e venda "
+                            "no período. O TACOS médio e a comissão de afiliado da barra "
+                            "lateral não são usados no diagnóstico."
+                        )
 
                     df_diag = build_diagnostico_df(
                         df_raw=df_raw,
                         df_vendas=df_shopee,
                         aliquota_imposto=aliquota + spike_day_rate,
-                        afiliado_pct=afiliado,
+                        afiliado_pct=0.0 if df_ads is not None else afiliado,
                         tacos_diag_pct=tacos_diag,
                         frete_gratis=frete_gratis,
+                        df_ads=df_ads,
                     )
 
                     if len(df_diag) == 0:
@@ -1750,15 +1885,34 @@ if uploaded is not None:
                                             "Lucro estimado", fmt_brl(lucro_tot),
                                             ajuda="Soma do lucro de todos os pedidos: lucro "
                                                   "por pedido de cada produto × pedidos. Já "
-                                                  "desconta custo, taxas, imposto e TACOS.",
+                                                  "desconta custo, taxas, imposto e Ads/"
+                                                  "Afiliado (ou TACOS).",
                                             rodape=f"{_pct(perc_lucro)} do faturamento",
                                             icone="✅", cor_valor=_cor_margem(lucro_tot),
                                             cor_destaque="#2ecc71" if lucro_tot >= 0 else "#E74C3C",
                                         ),
                                     ]
+                                    if "Ads Total (R$)" in df_diag_view.columns:
+                                        ads_tot = float(df_diag_view["Ads Total (R$)"].sum())
+                                        afil_tot = float(df_diag_view["Afiliado Total (R$)"].sum())
+                                        gasto_tot = ads_tot + afil_tot
+                                        perc_gasto = gasto_tot / gmv_tot * 100 if gmv_tot else 0.0
+                                        cards_valores.insert(3, kpi_card(
+                                            "Ads + Afiliado", fmt_brl(gasto_tot),
+                                            ajuda=(f"Ads: {fmt_brl(ads_tot)} · Afiliado: "
+                                                   f"{fmt_brl(afil_tot)}. Gasto real do "
+                                                   "período com anúncios e comissão de "
+                                                   "afiliados, somado do arquivo das "
+                                                   "campanhas para os produtos da tabela. "
+                                                   "Já está descontado do lucro e das "
+                                                   "margens."),
+                                            rodape=f"{_pct(perc_gasto)} do faturamento",
+                                            icone="📣", cor_valor="#ff9f68",
+                                            cor_destaque="#E67E22",
+                                        ))
                                     st.markdown(
                                         kpi_grid([card_media, card_volume], 2)
-                                        + kpi_grid(cards_valores, 4),
+                                        + kpi_grid(cards_valores, len(cards_valores)),
                                         unsafe_allow_html=True,
                                     )
                                 else:
@@ -1774,6 +1928,8 @@ if uploaded is not None:
                             COL_PRECO_DIAG: "R$ {:,.2f}",
                             "Comissão (R$)":             "R$ {:,.2f}",
                             "TACOS (R$)":                "R$ {:,.2f}",
+                            "Ads por pedido (R$)":       "R$ {:,.2f}",
+                            "Afiliado por pedido (R$)":  "R$ {:,.2f}",
                             "Lucro Atual (R$)":          "R$ {:,.2f}",
                             "GMV (R$)":                  "R$ {:,.2f}",
                             "Pedidos":                   "{:,.0f}",
@@ -1782,7 +1938,9 @@ if uploaded is not None:
                         }
                         # Oculta "TACOS" se não há tacos configurado
                         # Lucro Total fica só para os cards; a tabela mostra o Lucro Atual
-                        cols_drop_diag = ["Lucro Total (R$)"]
+                        cols_drop_diag = [
+                            "Lucro Total (R$)", "Ads Total (R$)", "Afiliado Total (R$)",
+                        ]
                         if tacos_diag == 0.0:
                             cols_drop_diag.append("TACOS (R$)")
                         diag_display = df_diag_view.drop(
