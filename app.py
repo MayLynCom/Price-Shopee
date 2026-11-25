@@ -21,6 +21,7 @@ from fees import SHOPEE_FEE_TIERS, MARKETPLACES, TIKTOK_FRETE_GRATIS_PCT, TIKTOK
 from styles import (
     CUSTOM_CSS, TITLE_HTML, SIDEBAR_HEADER_HTML,
     section_header, badge_html,
+    KPI_CSS, kpi_card, kpi_grid, kpi_pill,
 )
 
 # ── Configuração da página ────────────────────────────────────────────────────
@@ -1648,8 +1649,14 @@ if uploaded is not None:
                         # ── Margens do diagnóstico (cards com explicação no "?") ──
                         if len(df_diag_view) > 0:
                             filtrado = bool(busca_diag or filtro_margem is not None)
-                            sufixo = f" ({len(df_diag_view)} filtrados)" if filtrado else ""
+                            n_prod = len(df_diag_view)
                             media_margem = float(df_diag_view["Margem Atual (%)"].mean())
+
+                            def _pct(v: float) -> str:
+                                return f"{v:.2f}%".replace(".", ",")
+
+                            def _cor_margem(v: float) -> str:
+                                return "#E74C3C" if v < 0 else "#2ecc71"
 
                             ajuda_media = (
                                 "Média simples das margens de cada produto, com todos "
@@ -1659,6 +1666,18 @@ if uploaded is not None:
                                 "vendas. Um produto com 1 pedido pesa o mesmo que um "
                                 "com 1.000."
                             )
+                            rodape_media = (
+                                f"{n_prod} produto(s){' filtrados' if filtrado else ''}"
+                                " · todos com o mesmo peso"
+                            )
+                            card_media = kpi_card(
+                                "Margem média dos produtos", _pct(media_margem),
+                                ajuda=ajuda_media, rodape=rodape_media, icone="📦",
+                                cor_valor=_cor_margem(media_margem),
+                                cor_destaque="#7B2FBE", grande=True,
+                            )
+
+                            st.markdown(KPI_CSS, unsafe_allow_html=True)
 
                             if "GMV (R$)" in df_diag_view.columns:
                                 gmv_tot = float(df_diag_view["GMV (R$)"].sum())
@@ -1676,57 +1695,66 @@ if uploaded is not None:
                                     "maior que a média; se fica ABAIXO, os mais vendidos "
                                     "estão com margem menor e puxam a conta para baixo."
                                 )
-
-                                c1, c2 = st.columns(2)
-                                with c1:
-                                    st.metric(
-                                        "Margem média dos produtos" + sufixo,
-                                        f"{media_margem:.2f}%",
-                                        help=ajuda_media,
+                                if abs(dif) < 0.005:
+                                    pill = kpi_pill("= igual à média dos produtos",
+                                                    "#e8d5ff", "#2d0a52")
+                                elif dif > 0:
+                                    pill = kpi_pill(
+                                        f"▲ {_pct(dif).rstrip('%')} p.p. acima da média dos produtos",
+                                        "#2ecc71", "rgba(46, 204, 113, 0.14)",
                                     )
-                                with c2:
-                                    st.metric(
-                                        "Margem pelo volume de vendas" + sufixo,
-                                        f"{marg_vol:.2f}%",
-                                        delta=f"{dif:+.2f} p.p. vs média dos produtos",
-                                        delta_color="normal" if abs(dif) >= 0.005 else "off",
-                                        help=ajuda_volume,
+                                else:
+                                    pill = kpi_pill(
+                                        f"▼ {_pct(-dif).rstrip('%')} p.p. abaixo da média dos produtos",
+                                        "#ff7b6b", "rgba(231, 76, 60, 0.16)",
                                     )
+                                card_volume = kpi_card(
+                                    "Margem pelo volume de vendas", _pct(marg_vol),
+                                    ajuda=ajuda_volume, rodape=pill, icone="📈",
+                                    cor_valor=_cor_margem(marg_vol),
+                                    cor_destaque="#2ecc71" if marg_vol >= 0 else "#E74C3C",
+                                    grande=True,
+                                )
 
-                                c3, c4, c5, c6 = st.columns(4)
-                                with c3:
-                                    st.metric(
+                                ticket = gmv_tot / ped_tot if ped_tot else 0.0
+                                perc_lucro = lucro_tot / gmv_tot * 100 if gmv_tot else 0.0
+                                cards_valores = [
+                                    kpi_card(
                                         "Faturamento (GMV)", fmt_brl(gmv_tot),
-                                        help="Soma do GMV dos produtos com custo "
-                                             "encontrado, no período do arquivo.",
-                                    )
-                                with c4:
-                                    st.metric(
+                                        ajuda="Soma do GMV dos produtos com custo "
+                                              "encontrado, no período do arquivo.",
+                                        rodape=f"{n_prod} produto(s) com custo",
+                                        icone="💰",
+                                    ),
+                                    kpi_card(
                                         "Pedidos", f"{ped_tot:,}".replace(",", "."),
-                                        help="Soma dos pedidos dos produtos com custo "
-                                             "encontrado.",
-                                    )
-                                with c5:
-                                    st.metric(
-                                        "Ticket médio geral",
-                                        fmt_brl(gmv_tot / ped_tot if ped_tot else 0.0),
-                                        help="Faturamento (GMV) ÷ Pedidos.",
-                                    )
-                                with c6:
-                                    st.metric(
+                                        ajuda="Soma dos pedidos dos produtos com custo "
+                                              "encontrado.",
+                                        rodape="no período do arquivo", icone="🛒",
+                                        cor_valor="#e8d5ff",
+                                    ),
+                                    kpi_card(
+                                        "Ticket médio geral", fmt_brl(ticket),
+                                        ajuda="Faturamento (GMV) ÷ Pedidos.",
+                                        rodape="GMV ÷ pedidos", icone="🧾",
+                                    ),
+                                    kpi_card(
                                         "Lucro estimado", fmt_brl(lucro_tot),
-                                        help="Soma do lucro de todos os pedidos: lucro "
-                                             "por pedido de cada produto × pedidos. Já "
-                                             "desconta custo, taxas, imposto e TACOS.",
-                                    )
+                                        ajuda="Soma do lucro de todos os pedidos: lucro "
+                                              "por pedido de cada produto × pedidos. Já "
+                                              "desconta custo, taxas, imposto e TACOS.",
+                                        rodape=f"{_pct(perc_lucro)} do faturamento",
+                                        icone="✅", cor_valor=_cor_margem(lucro_tot),
+                                        cor_destaque="#2ecc71" if lucro_tot >= 0 else "#E74C3C",
+                                    ),
+                                ]
+                                st.markdown(
+                                    kpi_grid([card_media, card_volume], 2)
+                                    + kpi_grid(cards_valores, 4),
+                                    unsafe_allow_html=True,
+                                )
                             else:
-                                c1, _ = st.columns([1, 2])
-                                with c1:
-                                    st.metric(
-                                        "Margem média dos produtos" + sufixo,
-                                        f"{media_margem:.2f}%",
-                                        help=ajuda_media,
-                                    )
+                                st.markdown(kpi_grid([card_media], 1), unsafe_allow_html=True)
 
                         def color_diag(row):
                             if row["Margem Atual (%)"] < 0:
