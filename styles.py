@@ -60,20 +60,23 @@ CUSTOM_CSS = """
     }
 
     /* ── Cards de métricas ── */
-    [data-testid="metric-container"] {
+    [data-testid="metric-container"],
+    [data-testid="stMetric"] {
         background: linear-gradient(135deg, #2d0a52 0%, #1f063b 100%);
         border: 1px solid #D4AF37;
         border-radius: 10px;
         padding: 16px 20px;
         box-shadow: 0 4px 15px rgba(212, 175, 55, 0.15);
     }
-    [data-testid="metric-container"] [data-testid="stMetricLabel"] {
+    [data-testid="metric-container"] [data-testid="stMetricLabel"],
+    [data-testid="stMetric"] [data-testid="stMetricLabel"] {
         color: #c8a8e9 !important;
         font-size: 0.8rem !important;
         text-transform: uppercase;
         letter-spacing: 0.8px;
     }
-    [data-testid="metric-container"] [data-testid="stMetricValue"] {
+    [data-testid="metric-container"] [data-testid="stMetricValue"],
+    [data-testid="stMetric"] [data-testid="stMetricValue"] {
         color: #D4AF37 !important;
         font-weight: 700 !important;
         font-size: 1.6rem !important;
