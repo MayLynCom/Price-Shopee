@@ -243,3 +243,152 @@ def badge_html(text: str, color: str = "#D4AF37") -> str:
     font-weight: 600;
 ">{text}</span>
 """
+
+
+# ── Cards de indicadores (KPIs) do diagnóstico ───────────────────────────────
+# Obs: o CSS global força a cor de <p>/<span>, então os cards usam só <div>.
+KPI_CSS = """
+<style>
+.kpi-grid {
+    display: grid;
+    gap: 14px;
+    margin: 6px 0 16px 0;
+}
+.kpi-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.kpi-grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.kpi-grid.cols-1 { grid-template-columns: minmax(0, 520px); }
+@media (max-width: 900px) {
+    .kpi-grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+    .kpi-grid.cols-2, .kpi-grid.cols-4 { grid-template-columns: minmax(0, 1fr); }
+}
+.kpi-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 10px;
+    min-height: 118px;
+    padding: 16px 18px 14px 18px;
+    background: linear-gradient(135deg, #2d0a52 0%, #1f063b 100%);
+    border: 1px solid #3d1562;
+    border-top: 3px solid var(--kpi-accent, #D4AF37);
+    border-radius: 12px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+.kpi-card.big { min-height: 140px; }
+.kpi-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #c8a8e9;
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+}
+.kpi-icon { font-size: 1rem; line-height: 1; }
+.kpi-help {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    margin-left: auto;
+    border: 1px solid #7B2FBE;
+    border-radius: 50%;
+    color: #c8a8e9;
+    font-size: 0.68rem;
+    font-weight: 700;
+    cursor: help;
+    outline: none;
+}
+.kpi-help:hover, .kpi-help:focus { border-color: #D4AF37; color: #D4AF37; }
+.kpi-tip {
+    visibility: hidden;
+    opacity: 0;
+    position: absolute;
+    top: 40px;
+    left: 10px;
+    right: 10px;
+    z-index: 50;
+    padding: 10px 12px;
+    background: #0f0120;
+    border: 1px solid #7B2FBE;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    color: #e8d5ff;
+    font-size: 0.8rem;
+    font-weight: 400;
+    line-height: 1.5;
+    letter-spacing: 0;
+    text-transform: none;
+    transition: opacity 0.15s ease;
+}
+.kpi-help:hover + .kpi-tip, .kpi-help:focus + .kpi-tip {
+    visibility: visible;
+    opacity: 1;
+}
+.kpi-value {
+    font-size: 1.55rem;
+    font-weight: 800;
+    line-height: 1.1;
+    color: var(--kpi-value, #D4AF37);
+    font-variant-numeric: tabular-nums;
+}
+.kpi-card.big .kpi-value { font-size: 2.1rem; }
+.kpi-foot {
+    display: flex;
+    align-items: center;
+    min-height: 24px;
+    color: #a98ec9;
+    font-size: 0.78rem;
+}
+.kpi-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--pill-fg, #e8d5ff);
+    background: var(--pill-bg, #2d0a52);
+}
+</style>
+"""
+
+
+def kpi_card(
+    titulo: str,
+    valor: str,
+    ajuda: str = "",
+    rodape: str = "",
+    icone: str = "",
+    cor_valor: str = "#D4AF37",
+    cor_destaque: str = "#D4AF37",
+    grande: bool = False,
+) -> str:
+    """HTML de um card de indicador com "?" que mostra a explicação."""
+    ajuda_html = (
+        f"<div class='kpi-help' tabindex='0'>?</div><div class='kpi-tip'>{ajuda}</div>"
+        if ajuda else ""
+    )
+    icone_html = f"<div class='kpi-icon'>{icone}</div>" if icone else ""
+    return (
+        f"<div class='kpi-card{' big' if grande else ''}' "
+        f"style='--kpi-accent:{cor_destaque}; --kpi-value:{cor_valor};'>"
+        f"<div class='kpi-head'>{icone_html}<div>{titulo}</div>{ajuda_html}</div>"
+        f"<div class='kpi-value'>{valor}</div>"
+        f"<div class='kpi-foot'>{rodape}</div>"
+        "</div>"
+    )
+
+
+def kpi_grid(cards: list[str], colunas: int) -> str:
+    return f"<div class='kpi-grid cols-{colunas}'>" + "".join(cards) + "</div>"
+
+
+def kpi_pill(texto: str, fg: str, bg: str) -> str:
+    return f"<div class='kpi-pill' style='--pill-fg:{fg}; --pill-bg:{bg};'>{texto}</div>"
