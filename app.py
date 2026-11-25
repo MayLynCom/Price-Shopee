@@ -270,21 +270,34 @@ def render_cost_breakdown(row: pd.Series, spike_day: bool = False) -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
-def parse_excel(file) -> pd.DataFrame | None:
+def parse_excel(file, aba_preferida: str | None = None) -> pd.DataFrame | None:
     """
     Lê o arquivo Excel e normaliza os nomes das colunas.
     Aceita variações comuns de nomes de coluna.
+
+    ``aba_preferida``: se a planilha tiver uma aba com esse nome (ex: "TikTok"),
+    ela é usada; senão, usa a primeira aba (comportamento padrão).
     Retorna None em caso de erro.
     """
     try:
-        df = pd.read_excel(file, dtype=str)
+        sheet = 0
+        if aba_preferida:
+            nomes_abas = pd.ExcelFile(file).sheet_names
+            alvo = aba_preferida.strip().lower()
+            sheet = next(
+                (n for n in nomes_abas if str(n).strip().lower() == alvo), 0
+            )
+            if hasattr(file, "seek"):
+                file.seek(0)
+        df = pd.read_excel(file, sheet_name=sheet, dtype=str)
         df.columns = [str(c).strip().lower() for c in df.columns]
         # Planilhas com colunas repetidas (ex: duas "Custo Ajustado") quebram
         # o pandas — mantém só a primeira ocorrência de cada nome.
         df = df.loc[:, ~df.columns.duplicated()]
 
         col_map = {
-            "id": ["id", "id_produto", "sku", "sku (obrigatório)", "sku do vendedor", "código", "codigo", "cod",
+            "id": ["id", "id_produto", "id do produto", "id de produto",
+                   "sku", "sku (obrigatório)", "sku do vendedor", "código", "codigo", "cod",
                    "mlb (item id)", "mlb(item id)", "mlb", "item id", "item_id"],
             "nome": ["nome", "nome_produto", "produto", "descrição", "descricao", "name",
                      "nome do produto"],
@@ -469,75 +482,72 @@ def parse_vendas_excel(file) -> pd.DataFrame | None:
         return None
 
 
-def parse_tiktok_precos_excel(file) -> pd.DataFrame | None:
+def parse_tiktok_vendas_excel(file) -> pd.DataFrame | None:
     """
-    Lê a planilha de "Editar em massa → Informações de vendas" exportada do
-    TikTok Shop Seller Center (aba "Template").
+    Lê a "Lista de produtos" (análise de produtos) exportada do TikTok Shop
+    Seller Center — arquivo product_list_AAAAMMDD.xlsx.
 
-    O arquivo tem linhas de metadados antes do cabeçalho real (chaves técnicas,
-    versão, "Obrigatório", "Não editável"...), então localizamos a linha que
-    contém "SKU do vendedor" e usamos ela como cabeçalho.
+    O arquivo tem linhas de metadados antes do cabeçalho real ("Data de
+    análise", grupos "Tudo / LIVE / Vídeo / Afiliado"...), então localizamos
+    a linha que contém "ID de produto" e "GMV" e usamos ela como cabeçalho.
+    As colunas "GMV" e "Pedidos" se repetem para cada canal (LIVE, vídeo,
+    afiliado...); usamos a PRIMEIRA ocorrência, que é o total ("Tudo").
 
-    Retorna um DataFrame com: id (= SKU do vendedor), nome_produto,
-    preco_efetivo (= "Preço de varejo", o preço atual do anúncio).
-    O cruzamento com a planilha de custos é feito pelo SKU do vendedor.
+    Retorna um DataFrame com: id (= ID de produto), nome_produto, gmv,
+    pedidos e preco_efetivo (= ticket médio = GMV ÷ Pedidos).
+    Produtos sem pedido no período são descartados.
     """
     try:
-        try:
-            raw = pd.read_excel(file, sheet_name="Template", header=None, dtype=str)
-        except ValueError:
-            raw = pd.read_excel(file, sheet_name=0, header=None, dtype=str)
+        raw = pd.read_excel(file, sheet_name=0, header=None, dtype=str)
 
         header_idx = None
         for i in range(min(len(raw), 15)):
             vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
-            if "sku do vendedor" in vals:
+            if "id de produto" in vals and "gmv" in vals and "pedidos" in vals:
                 header_idx = i
                 break
-            if header_idx is None and "seller_sku" in vals:
-                header_idx = i
         if header_idx is None:
             st.error(
-                "❌ Formato inesperado da planilha do TikTok Shop. Use o arquivo de "
-                "Editar em massa → Informações de vendas exportado do Seller Center."
+                "❌ Formato inesperado do arquivo do TikTok Shop. Use a "
+                "Lista de produtos (product_list) exportada da Análise de "
+                "produtos do Seller Center, com as colunas ID de produto, "
+                "GMV e Pedidos."
             )
             return None
 
-        df = raw.iloc[header_idx + 1:].copy()
-        df.columns = [str(c).strip().lower() for c in raw.iloc[header_idx].tolist()]
+        cabecalho = [str(v).strip().lower() for v in raw.iloc[header_idx].tolist()]
 
-        col_sku = "sku do vendedor" if "sku do vendedor" in df.columns else "seller_sku"
-        col_preco = next(
-            (c for c in ("preço de varejo (moeda local)", "price") if c in df.columns),
-            None,
-        )
-        col_nome = next(
-            (c for c in ("nome do produto", "product_name") if c in df.columns),
-            None,
-        )
-        if col_preco is None:
-            st.error("❌ Coluna de preço não encontrada na planilha do TikTok Shop.")
-            return None
+        def primeira(nome: str) -> int | None:
+            return cabecalho.index(nome) if nome in cabecalho else None
 
+        i_id, i_gmv, i_ped = primeira("id de produto"), primeira("gmv"), primeira("pedidos")
+        i_nome = primeira("nome do produto")
+
+        dados = raw.iloc[header_idx + 1:]
         out = pd.DataFrame({
-            "id": df[col_sku].astype(str).str.strip(),
+            "id": dados.iloc[:, i_id].astype(str).str.strip(),
             "nome_produto": (
-                df[col_nome].astype(str).str.strip() if col_nome else df[col_sku]
+                dados.iloc[:, i_nome].astype(str).str.strip()
+                if i_nome is not None else dados.iloc[:, i_id].astype(str)
             ),
-            # Linhas de instrução ("Obrigatório", "Não editável"...) viram 0,0
-            # e são descartadas pelo filtro abaixo.
-            "preco_efetivo": df[col_preco].map(parse_br_currency),
+            "gmv": dados.iloc[:, i_gmv].map(parse_br_currency),
+            "pedidos": dados.iloc[:, i_ped].map(parse_br_currency),
         })
         out = out[
-            ~out["id"].isin(["nan", "None", ""]) & (out["preco_efetivo"] > 0)
+            ~out["id"].isin(["nan", "None", ""])
+            & (out["gmv"] > 0)
+            & (out["pedidos"] > 0)
         ]
-        # Variações com o mesmo SKU: mantém o maior preço (critério conservador)
-        out = out.sort_values("preco_efetivo", ascending=False)
-        out = out.drop_duplicates(subset="id", keep="first")
+        # Se o mesmo produto aparecer em mais de uma linha, soma tudo.
+        out = (
+            out.groupby("id", as_index=False)
+            .agg({"nome_produto": "first", "gmv": "sum", "pedidos": "sum"})
+        )
+        out["preco_efetivo"] = out["gmv"] / out["pedidos"]
         return out.reset_index(drop=True)
 
     except Exception as e:
-        st.error(f"❌ Erro ao ler a planilha do TikTok Shop: {e}")
+        st.error(f"❌ Erro ao ler o arquivo do TikTok Shop: {e}")
         return None
 
 
@@ -561,9 +571,8 @@ def build_diagnostico_df(
                       Usado sozinho no diagnóstico, independente do TACOS
                       configurado na barra lateral (não são somados).
     """
-    cols_vendas = ["id", "preco_efetivo"] + (
-        ["nome_produto"] if "nome_produto" in df_vendas.columns else []
-    )
+    extras = [c for c in ("nome_produto", "gmv", "pedidos") if c in df_vendas.columns]
+    cols_vendas = ["id", "preco_efetivo"] + extras
     merged = df_raw[["id", "nome", "custo"]].merge(
         df_vendas[cols_vendas],
         on="id",
@@ -600,16 +609,26 @@ def build_diagnostico_df(
             nome = nome_mkt
         margem = lucro / P * 100 if P > 0 else 0.0
 
-        rows.append({
+        linha = {
             "ID Produto":                str(p.get("id", "")),
             "Nome":                      nome,
             "Custo (R$)":                round(custo, 2),
-            COL_PRECO_DIAG: round(P, 2),
+        }
+        # TikTok: faturamento (GMV) e pedidos do período → ticket médio
+        if "gmv" in p:
+            linha["GMV (R$)"] = round(float(p.get("gmv") or 0.0), 2)
+            linha["Pedidos"] = int(float(p.get("pedidos") or 0))
+        linha.update({
+            COL_PRECO_DIAG:              round(P, 2),
             "Comissão (R$)":             round(commission, 2),
             "TACOS (R$)":                round(tacos_val, 2),
             "Lucro Atual (R$)":          round(lucro, 2),
-            "Margem Atual (%)":          round(margem, 2),
         })
+        if "gmv" in p:
+            # Lucro de todos os pedidos do período (lucro por pedido × pedidos)
+            linha["Lucro Total (R$)"] = round(lucro * linha["Pedidos"], 2)
+        linha["Margem Atual (%)"] = round(margem, 2)
+        rows.append(linha)
 
     return pd.DataFrame(rows)
 
@@ -820,11 +839,14 @@ def generate_excel(
         ca2 = Alignment(horizontal="center", vertical="center")
         la2 = Alignment(horizontal="left", vertical="center")
 
-        diag_cols = [
-            "ID Produto", "Nome", "Custo (R$)", COL_PRECO_DIAG,
-            "Comissão (R$)", "TACOS (R$)",
-            "Lucro Atual (R$)", "Margem Atual (%)",
-        ]
+        tem_gmv = "GMV (R$)" in df_diagnostico.columns
+        diag_cols = (
+            ["ID Produto", "Nome", "Custo (R$)"]
+            + (["GMV (R$)", "Pedidos"] if tem_gmv else [])
+            + [COL_PRECO_DIAG, "Comissão (R$)", "TACOS (R$)", "Lucro Atual (R$)"]
+            + (["Lucro Total (R$)"] if tem_gmv else [])
+            + ["Margem Atual (%)"]
+        )
         n_cols2 = len(diag_cols)
         last_col2 = get_column_letter(n_cols2)
 
@@ -879,22 +901,20 @@ def generate_excel(
                 fill_alt2 if ri % 2 == 0 else fill_normal2
             )
 
-            values2 = [
-                row2["ID Produto"],
-                row2["Nome"],
-                row2.get("Custo (R$)", 0.0),
-                row2.get(COL_PRECO_DIAG, 0.0),
-                row2.get("Comissão (R$)", 0.0),
-                row2.get("TACOS (R$)", 0.0),
-                row2.get("Lucro Atual (R$)", 0.0),
-                margem_val,
-            ]
-            formats2 = [
-                None, None,
-                currency_num2, currency_num2,
-                currency_num2, currency_num2,
-                currency_num2, pct_num2,
-            ]
+            values2, formats2 = [], []
+            for col in diag_cols:
+                if col in ("ID Produto", "Nome"):
+                    values2.append(row2.get(col, ""))
+                    formats2.append(None)
+                elif col == "Margem Atual (%)":
+                    values2.append(margem_val)
+                    formats2.append(pct_num2)
+                elif col == "Pedidos":
+                    values2.append(int(row2.get(col, 0) or 0))
+                    formats2.append("#,##0")
+                else:
+                    values2.append(float(row2.get(col, 0.0) or 0.0))
+                    formats2.append(currency_num2)
 
             for ci, (val, fmt) in enumerate(zip(values2, formats2), start=1):
                 cell = ws2.cell(row=ri, column=ci, value=val)
@@ -931,7 +951,34 @@ def generate_excel(
         media_cell.number_format = pct_num2
         ws2.row_dimensions[media_row].height = 22
 
-        col_widths2 = [16, 32, 13, 18, 13, 13, 15, 14]
+        # TikTok: margem da conta ponderada pelo faturamento (GMV)
+        if tem_gmv:
+            gmv_tot2 = float(df_diagnostico["GMV (R$)"].sum())
+            lucro_tot2 = float(df_diagnostico["Lucro Total (R$)"].sum())
+            pond_val = lucro_tot2 / gmv_tot2 * 100 if gmv_tot2 > 0 else 0.0
+            pond_row = media_row + 1
+            ws2.merge_cells(f"A{pond_row}:{get_column_letter(n_cols2 - 1)}{pond_row}")
+            ws2[f"A{pond_row}"] = (
+                f"Margem da Conta (ponderada pelo GMV) · GMV {fmt_brl(gmv_tot2)}"
+                f" · Lucro {fmt_brl(lucro_tot2)}"
+            )
+            ws2[f"A{pond_row}"].font = font_media2
+            ws2[f"A{pond_row}"].fill = fill_media2
+            ws2[f"A{pond_row}"].alignment = la2
+            ws2[f"A{pond_row}"].border = thin_gold2
+            pond_cell = ws2.cell(row=pond_row, column=n_cols2, value=pond_val)
+            pond_cell.font = Font(
+                name="Calibri", bold=True, size=11,
+                color=VERMELHO2 if pond_val < 0 else "2ecc71",
+            )
+            pond_cell.fill = fill_media2
+            pond_cell.alignment = ca2
+            pond_cell.border = thin_gold2
+            pond_cell.number_format = pct_num2
+            ws2.row_dimensions[pond_row].height = 22
+
+        col_widths2 = [16, 32, 13] + ([15, 10] if tem_gmv else []) + [
+            16, 13, 13, 15] + ([16] if tem_gmv else []) + [14]
         for i2, w2 in enumerate(col_widths2, start=1):
             ws2.column_dimensions[get_column_letter(i2)].width = w2
         ws2.freeze_panes = f"A{first_data2}"
@@ -981,9 +1028,9 @@ MP = MARKETPLACES[st.session_state["marketplace"]]
 COL_COM = f"Comissão {MP.nome} (R$)"
 COL_TAXA = f"Taxa Fixa {MP.nome} (R$)"
 # Shopee: preço médio efetivo do relatório de vendas.
-# TikTok: preço atual do anúncio (planilha de edição em massa).
+# TikTok: ticket médio = GMV ÷ Pedidos (lista de produtos do Seller Center).
 COL_PRECO_DIAG = (
-    "Preço Médio de Venda (R$)" if MP.chave == "shopee" else "Preço Atual (R$)"
+    "Preço Médio de Venda (R$)" if MP.chave == "shopee" else "Ticket Médio (R$)"
 )
 
 st.markdown(
@@ -1145,9 +1192,15 @@ st.markdown(
 
 # ── Processamento ─────────────────────────────────────────────────────────────
 if uploaded is not None:
-    if "last_file" not in st.session_state or st.session_state.last_file != uploaded.name:
-        st.session_state.last_file = uploaded.name
-        st.session_state.df_raw = parse_excel(uploaded)
+    # Na aba TikTok, usa a aba "TikTok" da planilha de custos (ID do produto
+    # + Custo), se existir. A chave inclui o marketplace para reler o arquivo
+    # ao trocar de aba.
+    chave_arquivo = f"{MP.chave}:{uploaded.name}"
+    if st.session_state.get("last_file") != chave_arquivo:
+        st.session_state.last_file = chave_arquivo
+        st.session_state.df_raw = parse_excel(
+            uploaded, aba_preferida="TikTok" if MP.chave == "tiktok" else None
+        )
         # Ao trocar de arquivo, descarta margens individuais antigas
         st.session_state.pop("margens_override", None)
 
@@ -1441,13 +1494,15 @@ if uploaded is not None:
                     )
                 else:
                     hint_diag = (
-                        "No TikTok Shop Seller Center, vá em <b>Produtos → Editar em massa → "
-                        "Informações de vendas</b>, baixe a planilha e faça o upload aqui.<br>"
-                        "O <code style='color:#e8d5ff'>SKU</code> da sua planilha de custos "
-                        "deve ser o <b style='color:#e8d5ff'>SKU do vendedor</b> no TikTok.<br>"
-                        "A margem é calculada com base no <b style='color:#e8d5ff'>preço atual "
-                        "do anúncio</b> (coluna <i>Preço de varejo</i>), com as taxas do "
-                        "TikTok Shop" + (" e o Frete Grátis" if frete_gratis else "") + "."
+                        "No TikTok Shop Seller Center, vá em <b>Análise de dados → "
+                        "Análise de produtos</b>, exporte a <b>Lista de produtos</b> "
+                        "do período e faça o upload aqui.<br>"
+                        "O custo é buscado pelo <b style='color:#e8d5ff'>ID do produto</b> "
+                        "na aba <b>TikTok</b> da sua planilha de custos.<br>"
+                        "O <b style='color:#e8d5ff'>ticket médio</b> de cada produto é "
+                        "<b>GMV ÷ Pedidos</b> no período, e a margem usa as taxas do "
+                        "TikTok Shop" + (" (com Frete Grátis)" if frete_gratis else "")
+                        + " e o imposto da barra lateral."
                     )
                 st.markdown(
                     "<div style='background:#2d0a52; border:1px solid #7B2FBE; border-radius:8px;"
@@ -1467,7 +1522,7 @@ if uploaded is not None:
                     st.session_state[f"df_diag_src_{MP.chave}"] = (
                         parse_vendas_excel(uploaded_shopee)
                         if MP.chave == "shopee"
-                        else parse_tiktok_precos_excel(uploaded_shopee)
+                        else parse_tiktok_vendas_excel(uploaded_shopee)
                     )
 
                 df_shopee = st.session_state.get(f"df_diag_src_{MP.chave}")
@@ -1510,8 +1565,8 @@ if uploaded is not None:
                             + ("Verifique se o ID da planilha de custos coincide "
                                "com o ID do Produto na Shopee."
                                if MP.chave == "shopee" else
-                               "Verifique se o SKU da planilha de custos coincide "
-                               "com o SKU do vendedor no TikTok Shop.")
+                               "Verifique se a planilha de custos tem a aba TikTok "
+                               "com o ID do produto igual ao do TikTok Shop.")
                         )
                     else:
                         n_matched = len(df_diag)
@@ -1616,6 +1671,37 @@ if uploaded is not None:
                                 unsafe_allow_html=True,
                             )
 
+                        # ── TikTok: resumo da conta pelo faturamento ─────────
+                        if "GMV (R$)" in df_diag_view.columns and len(df_diag_view) > 0:
+                            gmv_tot = float(df_diag_view["GMV (R$)"].sum())
+                            ped_tot = int(df_diag_view["Pedidos"].sum())
+                            lucro_tot = float(df_diag_view["Lucro Total (R$)"].sum())
+                            marg_pond = lucro_tot / gmv_tot * 100 if gmv_tot > 0 else 0.0
+                            cor_mp = "#E74C3C" if marg_pond < 0 else "#2ecc71"
+
+                            def _caixa(titulo: str, valor: str, cor: str = "#D4AF37") -> str:
+                                return (
+                                    "<div style='background:#1f063b; border:1px solid #7B2FBE;"
+                                    " border-radius:8px; padding:10px 18px; min-width:170px;'>"
+                                    f"<div style='color:#c8a8e9; font-size:0.8rem;'>{titulo}</div>"
+                                    f"<div style='color:{cor}; font-size:1.2rem; font-weight:700;'>"
+                                    f"{valor}</div></div>"
+                                )
+
+                            st.markdown(
+                                "<div style='display:flex; gap:12px; flex-wrap:wrap;"
+                                " margin-bottom:10px;'>"
+                                + _caixa("Faturamento (GMV)", fmt_brl(gmv_tot))
+                                + _caixa("Pedidos", f"{ped_tot:,}".replace(",", "."))
+                                + _caixa("Ticket médio geral",
+                                         fmt_brl(gmv_tot / ped_tot if ped_tot else 0.0))
+                                + _caixa("Lucro estimado", fmt_brl(lucro_tot), cor_mp)
+                                + _caixa("Margem da conta (ponderada pelo GMV)",
+                                         f"{marg_pond:.2f}%", cor_mp)
+                                + "</div>",
+                                unsafe_allow_html=True,
+                            )
+
                         def color_diag(row):
                             if row["Margem Atual (%)"] < 0:
                                 return ["background-color: #2e0a0a; color: #FFFFFF"] * len(row)
@@ -1627,6 +1713,9 @@ if uploaded is not None:
                             "Comissão (R$)":             "R$ {:,.2f}",
                             "TACOS (R$)":                "R$ {:,.2f}",
                             "Lucro Atual (R$)":          "R$ {:,.2f}",
+                            "GMV (R$)":                  "R$ {:,.2f}",
+                            "Pedidos":                   "{:,.0f}",
+                            "Lucro Total (R$)":          "R$ {:,.2f}",
                             "Margem Atual (%)":          "{:.2f}%",
                         }
                         # Oculta "TACOS" se não há tacos configurado
