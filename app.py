@@ -626,7 +626,9 @@ def build_diagnostico_df(
             "Lucro Atual (R$)":          round(lucro, 2),
         })
         if "gmv" in p:
-            # Lucro de todos os pedidos do período (lucro por pedido × pedidos)
+            # Lucro de todos os pedidos do período (lucro por pedido × pedidos).
+            # Usado só nos totais (Lucro estimado / margem pelo volume); não
+            # aparece na tabela nem no Excel.
             linha["Lucro Total (R$)"] = round(lucro * linha["Pedidos"], 2)
         linha["Margem Atual (%)"] = round(margem, 2)
         rows.append(linha)
@@ -845,7 +847,6 @@ def generate_excel(
             ["ID Produto", "Nome", "Custo (R$)"]
             + (["GMV (R$)", "Pedidos"] if tem_gmv else [])
             + [COL_PRECO_DIAG, "Comissão (R$)", "TACOS (R$)", "Lucro Atual (R$)"]
-            + (["Lucro Total (R$)"] if tem_gmv else [])
             + ["Margem Atual (%)"]
         )
         n_cols2 = len(diag_cols)
@@ -960,8 +961,8 @@ def generate_excel(
             pond_row = media_row + 1
             ws2.merge_cells(f"A{pond_row}:{get_column_letter(n_cols2 - 1)}{pond_row}")
             ws2[f"A{pond_row}"] = (
-                f"Margem da Conta (ponderada pelo GMV) · GMV {fmt_brl(gmv_tot2)}"
-                f" · Lucro {fmt_brl(lucro_tot2)}"
+                f"Margem pelo Volume de Vendas · Faturamento {fmt_brl(gmv_tot2)}"
+                f" · Lucro estimado {fmt_brl(lucro_tot2)}"
             )
             ws2[f"A{pond_row}"].font = font_media2
             ws2[f"A{pond_row}"].fill = fill_media2
@@ -979,7 +980,7 @@ def generate_excel(
             ws2.row_dimensions[pond_row].height = 22
 
         col_widths2 = [16, 32, 13] + ([15, 10] if tem_gmv else []) + [
-            16, 13, 13, 15] + ([16] if tem_gmv else []) + [14]
+            16, 13, 13, 15, 14]
         for i2, w2 in enumerate(col_widths2, start=1):
             ws2.column_dimensions[get_column_letter(i2)].width = w2
         ws2.freeze_panes = f"A{first_data2}"
@@ -1773,7 +1774,8 @@ if uploaded is not None:
                             "Margem Atual (%)":          "{:.2f}%",
                         }
                         # Oculta "TACOS" se não há tacos configurado
-                        cols_drop_diag = []
+                        # Lucro Total fica só para os cards; a tabela mostra o Lucro Atual
+                        cols_drop_diag = ["Lucro Total (R$)"]
                         if tacos_diag == 0.0:
                             cols_drop_diag.append("TACOS (R$)")
                         diag_display = df_diag_view.drop(
