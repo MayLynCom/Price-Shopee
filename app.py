@@ -1645,62 +1645,88 @@ if uploaded is not None:
                                 f"{len(df_diag_view)} produto(s) · filtro: {', '.join(partes)}."
                             )
 
-                        # ── Margem média dos produtos visíveis ────────────────────
+                        # ── Margens do diagnóstico (cards com explicação no "?") ──
                         if len(df_diag_view) > 0:
-                            media_margem = df_diag_view["Margem Atual (%)"].mean()
-                            media_cor  = "#E74C3C" if media_margem < 0 else "#2ecc71"
-                            media_bg   = "#2e0a0a" if media_margem < 0 else "#0a2e16"
-                            media_bord = "#E74C3C" if media_margem < 0 else "#27ae60"
-                            label_filtro = (
-                                f" (dos {len(df_diag_view)} filtrados)"
-                                if (busca_diag or filtro_margem is not None)
-                                else ""
-                            )
-                            st.markdown(
-                                f"<div style='"
-                                f"display:inline-flex; align-items:center; gap:10px;"
-                                f"background:{media_bg}; border:1px solid {media_bord};"
-                                f"border-radius:8px; padding:10px 20px; margin-bottom:10px;"
-                                f"'>"
-                                f"<span style='color:#c8a8e9; font-size:0.85rem;'>"
-                                f"Margem média{label_filtro}</span>"
-                                f"<span style='color:{media_cor}; font-size:1.25rem;"
-                                f" font-weight:700; letter-spacing:0.5px;'>"
-                                f"{media_margem:.2f}%</span>"
-                                f"</div>",
-                                unsafe_allow_html=True,
+                            filtrado = bool(busca_diag or filtro_margem is not None)
+                            sufixo = f" ({len(df_diag_view)} filtrados)" if filtrado else ""
+                            media_margem = float(df_diag_view["Margem Atual (%)"].mean())
+
+                            ajuda_media = (
+                                "Média simples das margens de cada produto, com todos "
+                                "os produtos tendo o mesmo peso. É como se cada um "
+                                "vendesse a mesma quantidade pelo preço atual: mostra a "
+                                "saúde da sua tabela de preços, sem olhar o volume de "
+                                "vendas. Um produto com 1 pedido pesa o mesmo que um "
+                                "com 1.000."
                             )
 
-                        # ── TikTok: resumo da conta pelo faturamento ─────────
-                        if "GMV (R$)" in df_diag_view.columns and len(df_diag_view) > 0:
-                            gmv_tot = float(df_diag_view["GMV (R$)"].sum())
-                            ped_tot = int(df_diag_view["Pedidos"].sum())
-                            lucro_tot = float(df_diag_view["Lucro Total (R$)"].sum())
-                            marg_pond = lucro_tot / gmv_tot * 100 if gmv_tot > 0 else 0.0
-                            cor_mp = "#E74C3C" if marg_pond < 0 else "#2ecc71"
+                            if "GMV (R$)" in df_diag_view.columns:
+                                gmv_tot = float(df_diag_view["GMV (R$)"].sum())
+                                ped_tot = int(df_diag_view["Pedidos"].sum())
+                                lucro_tot = float(df_diag_view["Lucro Total (R$)"].sum())
+                                marg_vol = lucro_tot / gmv_tot * 100 if gmv_tot > 0 else 0.0
+                                dif = marg_vol - media_margem
 
-                            def _caixa(titulo: str, valor: str, cor: str = "#D4AF37") -> str:
-                                return (
-                                    "<div style='background:#1f063b; border:1px solid #7B2FBE;"
-                                    " border-radius:8px; padding:10px 18px; min-width:170px;'>"
-                                    f"<div style='color:#c8a8e9; font-size:0.8rem;'>{titulo}</div>"
-                                    f"<div style='color:{cor}; font-size:1.2rem; font-weight:700;'>"
-                                    f"{valor}</div></div>"
+                                ajuda_volume = (
+                                    "Margem real da conta no período, considerando o "
+                                    "volume de vendas: lucro estimado total ÷ "
+                                    "faturamento total (GMV). Produtos que venderam mais "
+                                    "pesam mais no resultado. Se ela fica ACIMA da margem "
+                                    "média dos produtos, os campeões de venda têm margem "
+                                    "maior que a média; se fica ABAIXO, os mais vendidos "
+                                    "estão com margem menor e puxam a conta para baixo."
                                 )
 
-                            st.markdown(
-                                "<div style='display:flex; gap:12px; flex-wrap:wrap;"
-                                " margin-bottom:10px;'>"
-                                + _caixa("Faturamento (GMV)", fmt_brl(gmv_tot))
-                                + _caixa("Pedidos", f"{ped_tot:,}".replace(",", "."))
-                                + _caixa("Ticket médio geral",
-                                         fmt_brl(gmv_tot / ped_tot if ped_tot else 0.0))
-                                + _caixa("Lucro estimado", fmt_brl(lucro_tot), cor_mp)
-                                + _caixa("Margem da conta (ponderada pelo GMV)",
-                                         f"{marg_pond:.2f}%", cor_mp)
-                                + "</div>",
-                                unsafe_allow_html=True,
-                            )
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    st.metric(
+                                        "Margem média dos produtos" + sufixo,
+                                        f"{media_margem:.2f}%",
+                                        help=ajuda_media,
+                                    )
+                                with c2:
+                                    st.metric(
+                                        "Margem pelo volume de vendas" + sufixo,
+                                        f"{marg_vol:.2f}%",
+                                        delta=f"{dif:+.2f} p.p. vs média dos produtos",
+                                        delta_color="normal" if abs(dif) >= 0.005 else "off",
+                                        help=ajuda_volume,
+                                    )
+
+                                c3, c4, c5, c6 = st.columns(4)
+                                with c3:
+                                    st.metric(
+                                        "Faturamento (GMV)", fmt_brl(gmv_tot),
+                                        help="Soma do GMV dos produtos com custo "
+                                             "encontrado, no período do arquivo.",
+                                    )
+                                with c4:
+                                    st.metric(
+                                        "Pedidos", f"{ped_tot:,}".replace(",", "."),
+                                        help="Soma dos pedidos dos produtos com custo "
+                                             "encontrado.",
+                                    )
+                                with c5:
+                                    st.metric(
+                                        "Ticket médio geral",
+                                        fmt_brl(gmv_tot / ped_tot if ped_tot else 0.0),
+                                        help="Faturamento (GMV) ÷ Pedidos.",
+                                    )
+                                with c6:
+                                    st.metric(
+                                        "Lucro estimado", fmt_brl(lucro_tot),
+                                        help="Soma do lucro de todos os pedidos: lucro "
+                                             "por pedido de cada produto × pedidos. Já "
+                                             "desconta custo, taxas, imposto e TACOS.",
+                                    )
+                            else:
+                                c1, _ = st.columns([1, 2])
+                                with c1:
+                                    st.metric(
+                                        "Margem média dos produtos" + sufixo,
+                                        f"{media_margem:.2f}%",
+                                        help=ajuda_media,
+                                    )
 
                         def color_diag(row):
                             if row["Margem Atual (%)"] < 0:
